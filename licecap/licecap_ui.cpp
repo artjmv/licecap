@@ -19,13 +19,11 @@
 
 
 #include <stdio.h>
-#include <stdarg.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
 #include <multimon.h>
 #include <shellapi.h>
-#include <ctype.h>
 #else
 #include "../WDL/swell/swell.h"
 #endif
@@ -197,7 +195,6 @@ static int g_ui_dpi = 96;
 static HFONT g_ui_font, g_ui_font_small;
 static HBRUSH g_ui_bg_brush;
 static int g_hot_btn, g_focus_btn;
-static bool g_arrow_click;
 static HHOOK g_kbd_hook;
 
 typedef struct {
@@ -1095,23 +1092,6 @@ void SaveConfig(HWND hwndDlg)
 #define COL_REC_BG      RGB(253,236,235)
 #define COL_REC_BORDER  RGB(228,158,152)
 
-// TEMP DEBUG LOG (removed after UI verification)
-static void UIDbg(const char *fmt, ...)
-{
-  static FILE *fp;
-  if (!fp)
-  {
-    fp = fopen("E:\Proyectos\licecap\_uicheck\uidbg.txt","a");
-    if (!fp) return;
-  }
-  va_list ap;
-  va_start(ap,fmt);
-  vfprintf(fp,fmt,ap);
-  va_end(ap);
-  fputc(10,fp);
-  fflush(fp);
-}
-
 
 static int UI(int px)
 {
@@ -1362,30 +1342,27 @@ static void UpdateHoverState(HWND hwndDlg)
   }
 }
 
-static bool PointInArrowZone(HWND hwndDlg, int id, POINT ptScreen)
+// Dialogs never receive WM_PARENTNOTIFY, so the split-button hit area is
+// resolved from the cursor position while the button is being clicked.
+static bool ArrowZoneNow(HWND hwndDlg, int id)
 {
   HWND b = GetDlgItem(hwndDlg,id);
   if (!b) return false;
-  if (id != IDC_REC && id != IDC_SAVE) return true;  // menu-only buttons
+  if (id != IDC_REC && id != IDC_SAVE) return true;
   RECT r;
+  POINT p;
   if (!GetWindowRect(b,&r)) return false;
-  r.left = r.right - UI(18);
-  return PtInRect(&r,ptScreen) != FALSE;
-}
-
-static bool AnyArrowZone(HWND hwndDlg, POINT ptScreen)
-{
-  return PointInArrowZone(hwndDlg,IDC_REC,ptScreen) || PointInArrowZone(hwndDlg,IDC_SAVE,ptScreen);
+  GetCursorPos(&p);
+  if (!PtInRect(&r,p)) return false;
+  return p.x >= r.right - UI(18);
 }
 
 static void ShowToolMenu(HWND hwndDlg, int id)
 {
-  UIDbg("ShowToolMenu id=%d state=%d", id, g_cap_state);
   HMENU m = CreatePopupMenu();
   if (!m) return;
 
   const UINT g_idle = g_cap_state ? MF_GRAYED : 0;
-  const UINT g_live = g_cap_state ? 0 : MF_GRAYED;
   const bool custom_fps = (g_max_fps != 10 && g_max_fps != 16 && g_max_fps != 30);
 
   if (id == IDC_REC)
@@ -1503,7 +1480,6 @@ static void TogglePause(HWND hwndDlg)
 
 static bool BeginCapture(HWND hwndDlg, const char *fn)
 {
-  UIDbg("BeginCapture %s state=%d", fn, g_cap_state);
   int w,h;
   GetViewRectSize(&w,&h);
   if (w < 2 || h < 2) return false;
@@ -2128,12 +2104,15 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 
       g_wndsize.init(hwndDlg);
       g_hwnd=NULL;
-      UI_Quit();
 #ifndef _WIN32
       SWELL_PostQuitMessage(0);
 #endif
 
     break;
+    case WM_NCDESTROY:
+      UI_Quit();
+    break;
+
     case WM_TIMER:
       if (wParam==1)
       {     
@@ -2432,16 +2411,6 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       return (LRESULT)(g_ui_bg_brush ? g_ui_bg_brush : GetStockObject(WHITE_BRUSH));
     }
 
-    case WM_PARENTNOTIFY:
-      if (LOWORD(wParam) == WM_LBUTTONDOWN)
-      {
-        // lParam is in the child's coordinates here, so ask for the real cursor
-        POINT p;
-        GetCursorPos(&p);
-        g_arrow_click = AnyArrowZone(hwndDlg,p);
-      }
-    break;
-
     case WM_CONTEXTMENU:
     {
       HWND child = (HWND)wParam;
@@ -2459,14 +2428,12 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
     case WM_COMMAND:
-      UIDbg("WM_COMMAND cmd=%d hi=%d arrow=%d state=%d", LOWORD(wParam), HIWORD(wParam), (int)g_arrow_click, g_cap_state);
       switch (LOWORD(wParam))
       {
         case IDC_REC:
-          if (g_arrow_click)
+          if (ArrowZoneNow(hwndDlg,IDC_REC))
           {
             ShowToolMenu(hwndDlg, IDC_REC);
-            g_arrow_click = false;
           }
           else if (!g_cap_state)
           {
@@ -2483,21 +2450,18 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
         break;
 
         case IDC_FRAME:
-          g_arrow_click = false;
           ShowToolMenu(hwndDlg, IDC_FRAME);
         break;
 
         case IDC_EDITBTN:
-          g_arrow_click = false;
           ShowToolMenu(hwndDlg, IDC_EDITBTN);
         break;
 
         case IDC_SAVE:
-          if (!g_arrow_click && g_pending_unsaved)
+          if (!ArrowZoneNow(hwndDlg,IDC_SAVE) && g_pending_unsaved)
             DoSaveAs(hwndDlg);
           else
             ShowToolMenu(hwndDlg, IDC_SAVE);
-          g_arrow_click = false;
         break;
 
         case IDM_NEW:
@@ -2649,6 +2613,11 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
             g_last_frame_capture_time=timeGetTime();
           }
         break;
+
+        case IDCANCEL:
+          if (!g_cap_state) SendMessage(hwndDlg,WM_CLOSE,0,0);
+        break;
+
       }
     break;
     case WM_CLOSE:
