@@ -12,3 +12,11 @@ dist/
 
 # UI verification screenshots produced by _uicheck*.ps1
 _uicheck/
+
+# Debug log written by UIDbg() (contains temp paths with the user name)
+*uidbg*.txt
+
+# Test captures saved by the app default name (screen recordings: private)
+gifcam_*.gif
+LICEcap_*.gif
+*.lcf

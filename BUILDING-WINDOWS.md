@@ -78,7 +78,7 @@ No VC++ redistributable, no DLLs to copy: it is portable.
 
 ```
 E:\Proyectos\licecap\run-licecap.bat
-C:\Users\jose-\OneDrive\Desktop\run-licecap.bat   (copia en el escritorio)
+%USERPROFILE%\Desktop\run-licecap.bat   (copia en el escritorio)
 ```
 
 Both files are identical. The launcher resolves the project by absolute path
@@ -115,7 +115,8 @@ machines) and `licecap.exe` runs as-is. Nothing was written to
 `C:\Program Files`, the registry or the Start Menu.
 
 The only file created outside the repository is the requested shortcut script
-`C:\Users\jose-\OneDrive\Desktop\run-licecap.bat`.
+`%USERPROFILE%\Desktop\run-licecap.bat` (o `%USERPROFILE%\OneDrive\Desktop\...`
+si el escritorio está redirigido a OneDrive).
 
 There is a NSIS script (`licecap/installer.nsi`) for a traditional installer,
 but NSIS (`makensis`) is **not installed** on this machine, and building it
