@@ -19,10 +19,13 @@
 
 
 #include <stdio.h>
+#include <stdarg.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
 #include <multimon.h>
+#include <shellapi.h>
+#include <ctype.h>
 #else
 #include "../WDL/swell/swell.h"
 #endif
@@ -183,6 +186,20 @@ WDL_String g_ini_file;
 
 HWND g_hwnd;
 
+// ---- GifCam-style UI state ------------------------------------------------
+static char g_pending_fn[2048];    // finished capture that is not saved yet
+static bool g_pending_unsaved;     // g_pending_fn is a temporary file
+static bool g_rec_is_temp;         // current capture writes to a temp file
+static char g_last_save_fn[2048];  // last path used by "Save As"
+static bool g_capture_cursor = true;
+static bool g_always_on_top;
+static int g_ui_dpi = 96;
+static HFONT g_ui_font, g_ui_font_small;
+static HBRUSH g_ui_bg_brush;
+static int g_hot_btn, g_focus_btn;
+static bool g_arrow_click;
+static HHOOK g_kbd_hook;
+
 typedef struct {
   DWORD   cbSize;
   DWORD   flags;
@@ -207,6 +224,7 @@ static void __LogicalToPhysicalPointForPerMonitorDPI(HWND hwnd, POINT *pt)
 void DoMouseCursor(LICE_IBitmap* sbm, HWND h, int xoffs, int yoffs)
 {
   // XP+ only
+  if (!g_capture_cursor) return;
 
   static BOOL (WINAPI *pGetCursorInfo)(pLPCURSORINFO);
   static bool tr;
@@ -485,46 +503,30 @@ static void GetViewRectSize(int *w, int *h)
   
 }
 
+void UpdateCaption(HWND hwndDlg);
+void UpdateStatusText(HWND hwndDlg);
+
+// GifCam keeps the size in the title bar and nothing else: the toolbar shows
+// the state. UpdateDimBoxes is the single entry point used all over the file.
 void UpdateDimBoxes(HWND hwndDlg)
 {
-  ShowWindow(GetDlgItem(hwndDlg, IDC_STATUS), (g_cap_state ? SW_SHOWNA : SW_HIDE));
+  if (!hwndDlg) return;
+
+  HWND b = GetDlgItem(hwndDlg, IDC_REC);
+  if (b)
   {
-    WDL_WndSizer__rec* rec=g_wndsize.get_item(IDC_REC);
-    if (rec && rec->last.left > 0)
-    {
-      int xmin=rec->last.left-4;     
-      static const unsigned short ids[] = { IDC_MAXFPS_LBL, IDC_MAXFPS, IDC_DIMLBL_1, IDC_XSZ, IDC_YSZ, IDC_DIMLBL };
-      int i;
-      for (i=0; i < sizeof(ids)/sizeof(ids[0]); ++i)
-      {
-        WDL_WndSizer__rec* rec=g_wndsize.get_item(ids[i]);
-        if (rec) 
-        {
-          int show = (rec->last.right > xmin || g_cap_state) ? SW_HIDE : SW_SHOWNA;
-          HWND h = GetDlgItem(hwndDlg, ids[i]);
-          if (h) ShowWindow(h, show);
-        }
-      }
-    }
+    const char *label = g_cap_state == 1 ? "Stop" : (g_cap_state == 2 ? "Resume" : "Rec");
+    char cur[64];
+    cur[0] = 0;
+    GetWindowTextA(b, cur, sizeof(cur));
+    if (strcmp(cur, label)) SetWindowTextA(b, label);
+    InvalidateRect(b, NULL, FALSE);
   }
+  HWND s = GetDlgItem(hwndDlg, IDC_SAVE);
+  if (s) InvalidateRect(s, NULL, FALSE);
 
-  if (!g_cap_state)
-  {
-    int x, y;
-    GetViewRectSize(&x,&y);
-
-    char buf[2048];
-    char obuf[2048];
-
-    ++g_reent;
-    sprintf(buf, "%d", x);
-    GetDlgItemText(hwndDlg, IDC_XSZ, obuf, sizeof(obuf));
-    if (strcmp(buf, obuf)) SetDlgItemText(hwndDlg, IDC_XSZ, buf);
-    sprintf(buf, "%d", y);
-    GetDlgItemText(hwndDlg, IDC_YSZ, obuf, sizeof(obuf));
-    if (strcmp(buf, obuf)) SetDlgItemText(hwndDlg, IDC_YSZ, buf);   
-    --g_reent;  
-  }
+  UpdateCaption(hwndDlg);
+  UpdateStatusText(hwndDlg);
 }
 
 
@@ -538,95 +540,82 @@ LICE_IBitmap *g_cap_bm_txt;  // is a LICE_SysBitmap
 
 void UpdateStatusText(HWND hwndDlg)
 {
-  if (!g_cap_state) return;
+  HWND st = GetDlgItem(hwndDlg, IDC_STATUS);
+  if (!st) return;
 
-  int x, y;
+  int x = 0, y = 0;
   if (g_cap_bm)
   {
-    x=g_cap_bm->getWidth();
-    y=g_cap_bm->getHeight();
+    x = g_cap_bm->getWidth();
+    y = g_cap_bm->getHeight();
   }
   else
   {
     GetViewRectSize(&x,&y);
   }
 
-  char buf[2048];
-  char oldtext[2048];
+  char buf[512];
+  char el[32];
+  const int secs = (int)(g_ms_written/1000);
+  snprintf(el,sizeof(el),"%d:%02d",secs/60,secs%60);
 
-  char dims[128];
-  sprintf(dims,"%dx%d", x, y);
-
-  char pbuf[64];
-  pbuf[0]=0;
-  const DWORD now=timeGetTime();
-  if (g_cap_state==1 && g_cap_prerolluntil)
+  if (!g_cap_state)
   {
-    if (WDL_TICKS_IN_RANGE_ENDING_AT(now,g_cap_prerolluntil,MAX_PREROLL_OR_DELAY)) snprintf(pbuf,sizeof(pbuf),"PREROLL: %d - ",(g_cap_prerolluntil-now+999)/1000);
+    if (g_pending_unsaved)
+      snprintf(buf,sizeof(buf),"RECORDED\n%s\n\nClick Save\nto keep it",el);
+    else
+      snprintf(buf,sizeof(buf),"%d x %d\n\n%d fps\n\nClick Rec\nto capture",x,y,g_max_fps);
   }
-  else if (g_cap_state == 2) 
+  else if (g_cap_state == 2)
   {
-    strcpy(pbuf,"Paused - ");
+    snprintf(buf,sizeof(buf),"PAUSED\n%s",el);
   }
-  snprintf(buf,sizeof(buf),"%s%s",pbuf,dims);
-
-#ifndef NO_LCF_SUPPORT
-  if (g_cap_lcf) strcat(buf, " LCF");
-#endif
-#ifdef VIDEO_ENCODER_SUPPORT
-  if (g_cap_video) 
+  else
   {
-    lstrcatn(buf, " ",sizeof(buf));
-    lstrcatn(buf,g_cap_video_ext,sizeof(buf));
-  }
-#endif
-  if (g_cap_gif) lstrcatn(buf, " GIF", sizeof(buf));
-  
-  if (g_cap_state)
-  {
-    snprintf_append(buf,sizeof(buf), " %d:%02d", g_ms_written/60000, (g_ms_written/1000)%60);
-  }
-  if (g_cap_state && g_frate_valid)
-  {   
-    snprintf_append(buf,sizeof(buf)," @ %.1ffps" ,g_frate_avg);
+    const DWORD now = timeGetTime();
+    if (g_cap_prerolluntil && WDL_TICKS_IN_RANGE_ENDING_AT(now,g_cap_prerolluntil,MAX_PREROLL_OR_DELAY))
+      snprintf(buf,sizeof(buf),"STARTING\n%d",(int)((g_cap_prerolluntil-now+999)/1000));
+    else
+      snprintf(buf,sizeof(buf),"RECORDING\n%s\n%.0f fps",el,g_frate_valid ? g_frate_avg : 0.0);
   }
 
-  GetDlgItemText(hwndDlg,IDC_STATUS,oldtext,sizeof(oldtext));
-  if (strcmp(buf,oldtext))
-  {
-    SetDlgItemText(hwndDlg,IDC_STATUS,buf);
-  }
+  char oldtext[512];
+  GetWindowTextA(st,oldtext,sizeof(oldtext));
+  if (strcmp(buf,oldtext)) SetWindowTextA(st,buf);
 }
 
 
 void UpdateCaption(HWND hwndDlg)
 {
-  if (!g_cap_state) 
+  if (!hwndDlg) return;
+
+  int x = 0, y = 0;
+  GetViewRectSize(&x,&y);
+
+  char buf[512];
+  char el[32];
+  const int secs = (int)(g_ms_written/1000);
+  snprintf(el,sizeof(el),"%d:%02d",secs/60,secs%60);
+
+  if (!g_cap_state)
   {
-#ifdef REAPER_LICECAP
-    SetWindowText(hwndDlg,"REAPER_LICEcap " LICECAP_VERSION " [stopped]");
-#else
-    SetWindowText(hwndDlg,"LICEcap " LICECAP_VERSION " [stopped]");
-#endif
+    snprintf(buf,sizeof(buf),"LICEcap %d x %d",x,y);
+    if (g_pending_unsaved) strncat(buf," - not saved",sizeof(buf)-strlen(buf)-1);
+  }
+  else if (g_cap_state == 2)
+  {
+    snprintf(buf,sizeof(buf),"LICEcap %d x %d - paused %s",x,y,el);
   }
   else
   {
-    const char *p=WDL_get_filepart(g_last_fn);
-    char buf[256];
-    char pbuf[64];
-    pbuf[0]=0;
-    if (g_cap_state==1 && g_cap_prerolluntil)
-    {
-      const DWORD now=timeGetTime();
-      if (WDL_TICKS_IN_RANGE_ENDING_AT(now,g_cap_prerolluntil,MAX_PREROLL_OR_DELAY))
-      {
-        snprintf(pbuf,sizeof(pbuf),"PREROLL: %d - ",(g_cap_prerolluntil-now+999)/1000);
-      }
-      else g_cap_prerolluntil=0;
-    }
-    snprintf(buf,sizeof(buf),"%s%.100s - LICEcap%s",pbuf,p,pbuf[0]?"":g_cap_state==1?" [recording]":" [paused]");
-    SetWindowText(hwndDlg,buf);
+    const DWORD now = timeGetTime();
+    if (g_cap_prerolluntil && WDL_TICKS_IN_RANGE_ENDING_AT(now,g_cap_prerolluntil,MAX_PREROLL_OR_DELAY))
+      snprintf(buf,sizeof(buf),"LICEcap %d x %d - starting in %d",x,y,(int)((g_cap_prerolluntil-now+999)/1000));
+    else
+      snprintf(buf,sizeof(buf),"LICEcap %d x %d - recording %s (%.0f fps)",x,y,el,g_frate_valid ? g_frate_avg : 0.0);
   }
+
+  SetWindowTextA(hwndDlg,buf);
 }
 
 void SaveRestoreRecRect(HWND hwndDlg, bool restore)
@@ -655,15 +644,12 @@ void SWELL_SetWindowResizeable(HWND, bool);
 
 void Capture_Finish(HWND hwndDlg)
 {
-  SetDlgItemText(hwndDlg,IDC_REC,"Record...");
-  EnableWindow(GetDlgItem(hwndDlg,IDC_STOP),0);
-
   if (g_cap_state)
   {
 #ifdef _WIN32
     SaveRestoreRecRect(hwndDlg,false);
     SetWindowLong(hwndDlg,GWL_STYLE,g_last_wndstyle);
-    SetWindowPos(hwndDlg,HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_DRAWFRAME|SWP_NOACTIVATE);
+    SetWindowPos(hwndDlg,g_always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_DRAWFRAME|SWP_NOACTIVATE);
     SaveRestoreRecRect(hwndDlg,true);
 #else
     if (g_capwnd_levelsave>=0)
@@ -721,6 +707,8 @@ void Capture_Finish(HWND hwndDlg)
 
   delete g_cap_bm;
   g_cap_bm=0;
+
+  UpdateDimBoxes(hwndDlg);
 }
 
 #ifdef VIDEO_ENCODER_SUPPORT
@@ -1064,6 +1052,10 @@ void SaveConfig(HWND hwndDlg)
   WritePrivateProfileString("licecap","gifloopcnt",buf,g_ini_file.Get());
   sprintf(buf, "%d", g_stop_after_msec);
   WritePrivateProfileString("licecap","stopafter",buf,g_ini_file.Get());
+  sprintf(buf, "%d", g_capture_cursor ? 1 : 0);
+  WritePrivateProfileString("licecap","cursor",buf,g_ini_file.Get());
+  sprintf(buf, "%d", g_always_on_top ? 1 : 0);
+  WritePrivateProfileString("licecap","ontop",buf,g_ini_file.Get());
   
   
 
@@ -1078,12 +1070,972 @@ void SaveConfig(HWND hwndDlg)
 
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// GifCam-style UI: flat side toolbar, drop-down menus, customization dialog
+///////////////////////////////////////////////////////////////////////////////
+
+#define UI_BTN_COL_W 88
+#define UI_PAD       6
+#define UI_BTN_GAP   6
+#define UI_BTN_H     26
+
+#define COL_BG          RGB(250,250,250)
+#define COL_BTN         RGB(245,246,248)
+#define COL_BTN_HOT     RGB(234,244,253)
+#define COL_BTN_DOWN    RGB(214,232,250)
+#define COL_BTN_DIS     RGB(246,246,246)
+#define COL_BORDER      RGB(200,204,209)
+#define COL_BORDER_HOT  RGB(140,180,225)
+#define COL_ACCENT      RGB(47,127,209)
+#define COL_TEXT        RGB(40,40,40)
+#define COL_TEXT_DIS    RGB(175,175,175)
+#define COL_TEXT_HOT    RGB(20,90,170)
+#define COL_SEP         RGB(224,226,229)
+#define COL_REC         RGB(216,58,48)
+#define COL_REC_BG      RGB(253,236,235)
+#define COL_REC_BORDER  RGB(228,158,152)
+
+// TEMP DEBUG LOG (removed after UI verification)
+static void UIDbg(const char *fmt, ...)
+{
+  static FILE *fp;
+  if (!fp)
+  {
+    fp = fopen("E:\Proyectos\licecap\_uicheck\uidbg.txt","a");
+    if (!fp) return;
+  }
+  va_list ap;
+  va_start(ap,fmt);
+  vfprintf(fp,fmt,ap);
+  va_end(ap);
+  fputc(10,fp);
+  fflush(fp);
+}
+
+
+static int UI(int px)
+{
+  return MulDiv(px, g_ui_dpi > 0 ? g_ui_dpi : 96, 96);
+}
+
+static void UI_Init(void)
+{
+  HDC dc = GetDC(NULL);
+  if (dc)
+  {
+    int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(NULL, dc);
+    if (dpi >= 72 && dpi <= 480) g_ui_dpi = dpi;
+  }
+  if (!g_ui_bg_brush) g_ui_bg_brush = CreateSolidBrush(COL_BG);
+  if (!g_ui_font)
+    g_ui_font = CreateFontA(-MulDiv(9,g_ui_dpi,72),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH|FF_DONTCARE,"Segoe UI");
+  if (!g_ui_font_small)
+    g_ui_font_small = CreateFontA(-MulDiv(8,g_ui_dpi,72),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH|FF_DONTCARE,"Segoe UI");
+}
+
+static void UI_Quit(void)
+{
+  if (g_ui_font) { DeleteObject(g_ui_font); g_ui_font = NULL; }
+  if (g_ui_font_small) { DeleteObject(g_ui_font_small); g_ui_font_small = NULL; }
+  if (g_ui_bg_brush) { DeleteObject(g_ui_bg_brush); g_ui_bg_brush = NULL; }
+}
+
+static void LayoutControls(HWND hwndDlg)
+{
+  RECT rc;
+  GetClientRect(hwndDlg,&rc);
+
+  const int tw = UI(UI_BTN_COL_W);
+  const int pad = UI(UI_PAD);
+  const int gap = UI(UI_BTN_GAP);
+  const int bh = UI(UI_BTN_H);
+
+  int x = rc.right - tw + pad;
+  int w = tw - 2*pad;
+  if (w < UI(40)) w = UI(40);
+
+  int y = pad;
+  static const int ids[] = { IDC_REC, IDC_FRAME, IDC_EDITBTN, IDC_SAVE };
+  int i;
+  for (i = 0; i < 4; i++)
+  {
+    HWND b = GetDlgItem(hwndDlg, ids[i]);
+    if (b) MoveWindow(b, x, y, w, bh, TRUE);
+    y += bh + gap;
+  }
+
+  HWND st = GetDlgItem(hwndDlg, IDC_STATUS);
+  if (st)
+  {
+    int sh = rc.bottom - y - pad;
+    if (sh < UI(20)) sh = UI(20);
+    MoveWindow(st, x, y, w, sh, TRUE);
+  }
+
+  HWND vr = GetDlgItem(hwndDlg, IDC_VIEWRECT);
+  if (vr)
+  {
+    int cw = rc.right - tw - UI(2);
+    int ch = rc.bottom - UI(2);
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+    SetWindowPos(vr, NULL, UI(1), UI(1), cw, ch, SWP_NOZORDER|SWP_NOACTIVATE);
+  }
+}
+
+// Cuts the capture area out of the window so the desktop shows through while
+// keeping the caption, the 1px frame and the toolbar clickable.
+static void ApplyWindowRegion(HWND hwndDlg)
+{
+  HWND vr = GetDlgItem(hwndDlg, IDC_VIEWRECT);
+  if (!vr) return;
+
+  RECT wr, vr2;
+  GetWindowRect(hwndDlg,&wr);
+  GetWindowRect(vr,&vr2);
+  OffsetRect(&vr2,-wr.left,-wr.top);
+  InflateRect(&vr2,-UI(1),-UI(1));
+
+  if (vr2.right <= vr2.left || vr2.bottom <= vr2.top)
+  {
+    SetWindowRgn(hwndDlg,NULL,TRUE);
+    return;
+  }
+
+  RECT full = {0,0,wr.right-wr.left,wr.bottom-wr.top};
+  HRGN rgn = CreateRectRgnIndirect(&full);
+  HRGN hole = CreateRectRgnIndirect(&vr2);
+  CombineRgn(rgn,rgn,hole,RGN_DIFF);
+  DeleteObject(hole);
+  SetWindowRgn(hwndDlg,rgn,TRUE);
+}
+
+static bool ButtonIsLive(int id)
+{
+  if (id == IDC_SAVE) return g_pending_unsaved;
+  return true;
+}
+
+static void DrawToolButton(LPDRAWITEMSTRUCT di)
+{
+  if (!di || di->CtlType != ODT_BUTTON) return;
+
+  HDC dc = di->hDC;
+  const int id = (int)di->CtlID;
+  RECT r = di->rcItem;
+  const bool hot = (g_hot_btn == id);
+  const bool focused = (GetFocus() == di->hwndItem);
+  const bool pressed = (di->itemState & ODS_SELECTED) != 0;
+  const bool split = (id == IDC_REC || id == IDC_SAVE);
+  const bool live = ButtonIsLive(id);
+  const bool rec = (id == IDC_REC && g_cap_state != 0);
+
+  FillRect(dc,&r,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(WHITE_BRUSH));
+
+  RECT br = r;
+  br.right--;
+  br.bottom--;
+
+  COLORREF fill, border, text;
+  if (rec)
+  {
+    fill = hot ? RGB(252,226,224) : COL_REC_BG;
+    border = focused ? COL_ACCENT : COL_REC_BORDER;
+    text = COL_REC;
+  }
+  else if (!live)
+  {
+    fill = COL_BTN_DIS;
+    border = COL_BORDER;
+    text = COL_TEXT_DIS;
+  }
+  else if (pressed)
+  {
+    fill = COL_BTN_DOWN;
+    border = COL_ACCENT;
+    text = COL_TEXT_HOT;
+  }
+  else if (hot)
+  {
+    fill = COL_BTN_HOT;
+    border = COL_BORDER_HOT;
+    text = COL_TEXT_HOT;
+  }
+  else
+  {
+    fill = COL_BTN;
+    border = focused ? COL_ACCENT : COL_BORDER;
+    text = COL_TEXT;
+  }
+
+  HBRUSH hb = CreateSolidBrush(fill);
+  HPEN hp = CreatePen(PS_SOLID,1,border);
+  HGDIOBJ ob = SelectObject(dc,hb);
+  HGDIOBJ op = SelectObject(dc,hp);
+  RoundRect(dc,br.left,br.top,br.right,br.bottom,UI(6),UI(6));
+  SelectObject(dc,ob);
+  SelectObject(dc,op);
+  DeleteObject(hb);
+  DeleteObject(hp);
+
+  SetBkMode(dc,TRANSPARENT);
+  HFONT f = g_ui_font ? g_ui_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+  HGDIOBJ of = SelectObject(dc,f);
+  SetTextColor(dc,text);
+
+  char label[64];
+  label[0] = 0;
+  GetWindowTextA(di->hwndItem,label,sizeof(label));
+  if (!label[0]) lstrcpyn_safe(label,id == IDC_REC ? "Rec" : id == IDC_FRAME ? "Frame" : id == IDC_EDITBTN ? "Edit" : "Save",sizeof(label));
+
+  RECT tr = r;
+  tr.left += UI(9);
+  tr.right -= split ? UI(16) : UI(7);
+  DrawTextA(dc,label,-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+
+  if (split)
+  {
+    int x = r.right - UI(16);
+    HPEN sp = CreatePen(PS_SOLID,1,hot ? RGB(202,222,242) : COL_BORDER);
+    HGDIOBJ osp = SelectObject(dc,sp);
+    MoveToEx(dc,x,r.top+UI(5),NULL);
+    LineTo(dc,x,r.bottom-UI(5));
+    SelectObject(dc,osp);
+    DeleteObject(sp);
+
+    int cx = r.right - UI(8);
+    int cy = (r.top + r.bottom - 1)/2 + UI(1);
+    POINT pts[3] = { {cx-UI(3),cy-UI(2)}, {cx+UI(3),cy-UI(2)}, {cx,cy+UI(2)} };
+    HBRUSH ab = CreateSolidBrush(text);
+    HGDIOBJ oab = SelectObject(dc,ab);
+    Polygon(dc,pts,3);
+    SelectObject(dc,oab);
+    DeleteObject(ab);
+  }
+
+  SelectObject(dc,of);
+}
+
+static void UpdateHoverState(HWND hwndDlg)
+{
+  int hot = 0;
+  if (GetForegroundWindow() == hwndDlg)
+  {
+    POINT p;
+    GetCursorPos(&p);
+    static const int ids[] = { IDC_REC, IDC_FRAME, IDC_EDITBTN, IDC_SAVE };
+    int i;
+    for (i = 0; i < 4; i++)
+    {
+      HWND b = GetDlgItem(hwndDlg, ids[i]);
+      RECT r;
+      if (b && IsWindowVisible(b) && GetWindowRect(b,&r) && PtInRect(&r,p))
+      {
+        hot = ids[i];
+        break;
+      }
+    }
+  }
+  if (hot != g_hot_btn)
+  {
+    HWND oldb = g_hot_btn ? GetDlgItem(hwndDlg,g_hot_btn) : NULL;
+    HWND newb = hot ? GetDlgItem(hwndDlg,hot) : NULL;
+    g_hot_btn = hot;
+    if (oldb) InvalidateRect(oldb,NULL,TRUE);
+    if (newb) InvalidateRect(newb,NULL,TRUE);
+  }
+
+  HWND f = GetFocus();
+  int fid = f ? GetDlgCtrlID(f) : 0;
+  if (fid != IDC_REC && fid != IDC_FRAME && fid != IDC_EDITBTN && fid != IDC_SAVE) fid = 0;
+  if (fid != g_focus_btn)
+  {
+    HWND oldb = g_focus_btn ? GetDlgItem(hwndDlg,g_focus_btn) : NULL;
+    g_focus_btn = fid;
+    if (oldb) InvalidateRect(oldb,NULL,TRUE);
+    if (f && fid) InvalidateRect(f,NULL,TRUE);
+  }
+}
+
+static bool PointInArrowZone(HWND hwndDlg, int id, POINT ptScreen)
+{
+  HWND b = GetDlgItem(hwndDlg,id);
+  if (!b) return false;
+  if (id != IDC_REC && id != IDC_SAVE) return true;  // menu-only buttons
+  RECT r;
+  if (!GetWindowRect(b,&r)) return false;
+  r.left = r.right - UI(18);
+  return PtInRect(&r,ptScreen) != FALSE;
+}
+
+static bool AnyArrowZone(HWND hwndDlg, POINT ptScreen)
+{
+  return PointInArrowZone(hwndDlg,IDC_REC,ptScreen) || PointInArrowZone(hwndDlg,IDC_SAVE,ptScreen);
+}
+
+static void ShowToolMenu(HWND hwndDlg, int id)
+{
+  UIDbg("ShowToolMenu id=%d state=%d", id, g_cap_state);
+  HMENU m = CreatePopupMenu();
+  if (!m) return;
+
+  const UINT g_idle = g_cap_state ? MF_GRAYED : 0;
+  const UINT g_live = g_cap_state ? 0 : MF_GRAYED;
+  const bool custom_fps = (g_max_fps != 10 && g_max_fps != 16 && g_max_fps != 30);
+
+  if (id == IDC_REC)
+  {
+    AppendMenuA(m, MF_STRING|g_idle, IDM_NEW, "New\tCtrl+N");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==10?MF_CHECKED:0), IDM_FPS10, "10 FPS\tF1");
+    AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==16?MF_CHECKED:0), IDM_FPS16, "16 FPS\tF2");
+    AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==30?MF_CHECKED:0), IDM_FPS30, "30 FPS\tF3");
+    AppendMenuA(m, MF_STRING|g_idle|(custom_fps?MF_CHECKED:0), IDM_FPS_CUSTOM, "Custom FPS...");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle|(g_capture_cursor?MF_CHECKED:0), IDM_CAPTURE_CURSOR, "Capture Cursor");
+    AppendMenuA(m, MF_STRING|g_idle|((g_prefs&4)?MF_CHECKED:0), IDM_CAPTURE_CLICKS, "Highlight Mouse Clicks");
+    AppendMenuA(m, MF_STRING|g_idle|((g_prefs&8)?MF_CHECKED:0), IDM_CAPTURE_TIME, "Show Elapsed Time");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_FULLSCREEN, "Full Screen");
+    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
+  }
+  else if (id == IDC_FRAME)
+  {
+    AppendMenuA(m, MF_STRING|(g_cap_state?0:MF_GRAYED), IDM_PAUSE,
+                g_cap_state == 2 ? "Resume Recording\tF4" : "Pause Recording\tF4");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|(g_cap_state==2?0:MF_GRAYED), IDM_INSERT_TEXT, "Insert Text Frame...");
+    AppendMenuA(m, MF_STRING|((g_cap_state==2 && g_title[0])?0:MF_GRAYED), IDM_INSERT_TITLE, "Insert Title Frame");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|(g_cap_state?0:MF_GRAYED), IDM_CANCEL_REC, "Cancel Recording");
+  }
+  else if (id == IDC_EDITBTN)
+  {
+    AppendMenuA(m, MF_STRING|g_idle, IDM_DEFAULT_SIZE, "Reset Window Size (512 x 512)");
+    AppendMenuA(m, MF_STRING|g_idle, IDM_FULLSCREEN, "Full Screen");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|(g_always_on_top?MF_CHECKED:0), IDM_ALWAYS_ON_TOP, "Always on Top");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
+  }
+  else if (id == IDC_SAVE)
+  {
+    AppendMenuA(m, MF_STRING|(g_pending_unsaved?0:MF_GRAYED), IDM_SAVEAS, "Save As...\tCtrl+S");
+    AppendMenuA(m, MF_STRING|((g_pending_unsaved||g_last_save_fn[0])?0:MF_GRAYED), IDM_SHOWINFOLDER, "Show in Folder");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_RECORD_TO_FILE, "Record to File...");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, IDM_ABOUT, "About LICEcap");
+  }
+  else
+  {
+    DestroyMenu(m);
+    return;
+  }
+
+  RECT r;
+  HWND b = GetDlgItem(hwndDlg,id);
+  if (!b || !GetWindowRect(b,&r))
+  {
+    DestroyMenu(m);
+    return;
+  }
+
+  SetForegroundWindow(hwndDlg);
+  int cmd = (int)TrackPopupMenuEx(m, TPM_LEFTALIGN|TPM_TOPALIGN|TPM_RETURNCMD|TPM_RIGHTBUTTON,
+                                  r.left, r.bottom + UI(2), hwndDlg, NULL);
+  DestroyMenu(m);
+  PostMessage(hwndDlg,WM_NULL,0,0);
+
+  if (cmd) SendMessage(hwndDlg,WM_COMMAND,(WPARAM)cmd,0);
+}
+
+// ---------------------------------------------------------------------------
+// capture / save flow (GifCam: record first, decide where to save later)
+// ---------------------------------------------------------------------------
+
+static void DiscardPending(void)
+{
+  if (g_pending_unsaved && g_pending_fn[0]) DeleteFileA(g_pending_fn);
+  g_pending_unsaved = false;
+  g_pending_fn[0] = 0;
+  g_rec_is_temp = false;
+  UpdateDimBoxes(g_hwnd);
+}
+
+static bool EnsurePauseSnapshot(HWND hwndDlg)
+{
+  if (!g_cap_bm) return false;
+  if (!g_cap_bm_txt)
+  {
+    g_cap_bm_txt = LICE_CreateSysBitmap(g_cap_bm->getWidth(),g_cap_bm->getHeight());
+    LICE_Copy(g_cap_bm_txt,g_cap_bm);
+  }
+  return g_cap_bm_txt != NULL;
+}
+
+static void TogglePause(HWND hwndDlg)
+{
+  if (g_cap_state == 1)
+  {
+    g_pause_time = timeGetTime();
+    EnsurePauseSnapshot(hwndDlg);
+    g_cap_state = 2;
+    UpdateDimBoxes(hwndDlg);
+  }
+  else if (g_cap_state == 2)
+  {
+    delete g_cap_bm_txt;
+    g_cap_bm_txt = NULL;
+    g_insert_cnt = 0;
+    g_last_frame_capture_time = g_cap_prerolluntil = timeGetTime()+PREROLL_AMT;
+    g_cap_state = 1;
+    UpdateDimBoxes(hwndDlg);
+  }
+}
+
+static bool BeginCapture(HWND hwndDlg, const char *fn)
+{
+  UIDbg("BeginCapture %s state=%d", fn, g_cap_state);
+  int w,h;
+  GetViewRectSize(&w,&h);
+  if (w < 2 || h < 2) return false;
+
+  lstrcpyn_safe(g_last_fn,fn,sizeof(g_last_fn));
+
+  delete g_cap_bm;
+#ifdef _WIN32
+  g_cap_bm = LICE_CreateSysBitmap(w,h);
+#else
+  delete g_cap_bm_inv;
+  g_cap_bm_inv = LICE_CreateSysBitmap(w,h);
+  g_cap_bm = new LICE_WrapperBitmap(g_cap_bm_inv->getBits(),g_cap_bm_inv->getWidth(),g_cap_bm_inv->getHeight(),g_cap_bm_inv->getRowSpan(),true);
+#endif
+
+  g_dotitle = ((g_prefs&1) && g_titlems);
+
+  if (strlen(g_last_fn)>4 && !stricmp(g_last_fn+strlen(g_last_fn)-4,".gif"))
+  {
+    void *ctx = LICE_WriteGIFBeginNoFrame(g_last_fn,w,h,(g_prefs&32) ? (-1)&~7 : 0,true);
+    if (ctx) g_cap_gif = new gif_encoder(ctx,g_gif_loopcount,0xf8);
+    g_cap_gif_lastsec_written = -1;
+
+#ifdef TEST_MULTIPLE_MODES
+    char tmp[1024];
+    sprintf(tmp,"%s.trans-nostats.gif",g_last_fn);
+    ctx = LICE_WriteGIFBeginNoFrame(tmp,w,h,(-1)&~(7|0x100),true);
+    if (ctx) g_cap_gif2 = new gif_encoder(ctx,g_gif_loopcount,0xf8);
+
+    sprintf(tmp,"%s.trans-0.gif",g_last_fn);
+    ctx = LICE_WriteGIFBeginNoFrame(tmp,w,h,0,true);
+    if (ctx) g_cap_gif3 = new gif_encoder(ctx,g_gif_loopcount,0xf8);
+#endif
+  }
+#ifdef VIDEO_ENCODER_SUPPORT
+  if (strlen(g_last_fn)>5 && !stricmp(g_last_fn+strlen(g_last_fn)-5,".webm"))
+  {
+#ifdef REAPER_LICECAP
+    static VideoEncoder *(*video_createEncoder2)(const char *);
+    if (!video_createEncoder2)
+      *(void **)&video_createEncoder2 = reaperAPI_getfunc("video_createEncoder2");
+
+    if (video_createEncoder2) g_cap_video = video_createEncoder2("WEBM");
+#endif
+
+    if (g_cap_video)
+    {
+      if (!g_cap_video->open(g_last_fn,"webm", "vp8", "vorbis", g_cap_video_vbr, 100, w,h, 30, g_cap_video_abr, 44100,2))
+      {
+        delete g_cap_video;
+        g_cap_video=0;
+      }
+      else
+      {
+        strcpy(g_cap_video_ext,"WEBM");
+#ifdef REAPER_LICECAP
+        s_audiohook_needsilence=0.0;
+        g_cap_video_lastt=-1.0;
+        s_audiohook_timepos=0.0;
+        if (!s_audiohook_reg)
+        {
+          Audio_RegHardwareHook(true,&s_audiohook);
+          s_audiohook_reg=true;
+        }
+        if (!s_audiothread)
+        {
+          unsigned id;
+          s_audiothread = (HANDLE)_beginthreadex(NULL,0,audioEncodeThread,0,0,&id);
+        }
+#endif
+      }
+    }
+  }
+#endif
+
+#ifndef NO_LCF_SUPPORT
+  if (strlen(g_last_fn)>4 && !stricmp(g_last_fn+strlen(g_last_fn)-4,".lcf"))
+  {
+    g_cap_lcf = new LICECaptureCompressor(g_last_fn,w,h);
+    if (!g_cap_lcf->IsOpen())
+    {
+      delete g_cap_lcf;
+      g_cap_lcf = NULL;
+    }
+  }
+#endif
+
+  if (!(g_cap_gif
+#ifndef NO_LCF_SUPPORT
+        || g_cap_lcf
+#endif
+#ifdef VIDEO_ENCODER_SUPPORT
+        || g_cap_video
+#endif
+      ))
+  {
+    delete g_cap_bm;
+    g_cap_bm = NULL;
+    return false;
+  }
+
+  if (g_dotitle)
+    WriteTextFrame(g_title,g_titlems,true,w,h);
+
+#ifdef _WIN32
+  SaveRestoreRecRect(hwndDlg,false);
+  g_last_wndstyle = SetWindowLong(hwndDlg,GWL_STYLE,GetWindowLong(hwndDlg,GWL_STYLE)&~WS_THICKFRAME);
+  SetWindowPos(hwndDlg,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_DRAWFRAME|SWP_NOACTIVATE);
+  SaveRestoreRecRect(hwndDlg,true);
+#else
+  if (g_capwnd_levelsave < 0)
+  {
+    g_capwnd_levelsave=SWELL_SetWindowLevel(hwndDlg,1000);
+  }
+  SWELL_SetWindowResizeable(hwndDlg,false);
+
+#ifdef __APPLE__
+  {
+    s_has_async_offset=false;
+
+    RECT r,r2;
+    if (GetAsyncNSWindowRect(hwndDlg,&r))
+    {
+      GetWindowRect(GetDlgItem(hwndDlg,IDC_VIEWRECT),&r2);
+      s_async_offset.x = r2.left - r.left;
+      s_async_offset.y = r2.top - r.top;
+      s_has_async_offset = true;
+    }
+  }
+#endif
+#endif
+
+  g_insert_cnt = 0;
+  g_frate_valid=false;
+  g_frate_avg=0.0;
+  g_ms_written = 0;
+
+  g_last_frame_capture_time = g_cap_prerolluntil = timeGetTime()+PREROLL_AMT;
+  g_cap_state=1;
+  UpdateDimBoxes(hwndDlg);
+  InvalidateRect(hwndDlg,NULL,TRUE);
+  return true;
+}
+
+static void StartTempCapture(HWND hwndDlg)
+{
+  DiscardPending();
+
+  char dir[MAX_PATH];
+  dir[0] = 0;
+  DWORD n = GetTempPathA(sizeof(dir),dir);
+  if (!n || n >= sizeof(dir)) lstrcpyn_safe(dir,".",sizeof(dir));
+
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  const int dl = (int)strlen(dir);
+  const char *sep = (dl && (dir[dl-1] == '\\' || dir[dl-1] == '/')) ? "" : "\\";
+
+  char fn[MAX_PATH];
+  snprintf(fn,sizeof(fn),"%s%sLICEcap_%04d%02d%02d_%02d%02d%02d.gif",dir,sep,
+           st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+
+  g_rec_is_temp = true;
+  if (!BeginCapture(hwndDlg,fn))
+  {
+    g_rec_is_temp = false;
+    DeleteFileA(fn);
+    MessageBoxA(hwndDlg,"Could not start the capture.","LICEcap",MB_OK|MB_ICONERROR);
+    return;
+  }
+  lstrcpyn_safe(g_pending_fn,fn,sizeof(g_pending_fn));
+  g_pending_unsaved = false;
+}
+
+static void RecordToFile(HWND hwndDlg)
+{
+  const char *tab[][2]={
+    { "GIF files (*.gif)\0*.gif\0", ".gif" },
+  #ifndef NO_LCF_SUPPORT
+    { "LiceCap files (*.lcf)\0*.lcf\0", ".lcf" },
+  #endif
+  #ifdef VIDEO_ENCODER_SUPPORT
+    { "WEBM files (*.webm)\0*.webm\0", ".webm" },
+  #endif
+    {NULL,NULL},
+  };
+
+  WDL_Queue qb;
+  int bm=0;
+  const int lfnlen=(int)strlen(g_last_fn);
+  int x;
+  if (lfnlen >= 3) for (x=0;tab[x][0];x++)
+  {
+    const int tx1l = (int)strlen(tab[x][1]);
+    if (lfnlen > tx1l && !stricmp(g_last_fn + lfnlen - tx1l, tab[x][1]))
+    {
+      bm=x;
+      break;
+    }
+  }
+  for (x=bm;tab[x][0];x++)
+  {
+    const char *p=tab[x][0];
+    while (*p)
+    {
+      int l = (int)strlen(p)+1;
+      qb.Add(p,l);
+      p+=l;
+    }
+  }
+  for (x=0;x<bm;x++)
+  {
+    const char *p=tab[x][0];
+    while (*p)
+    {
+      int l = (int)strlen(p)+1;
+      qb.Add(p,l);
+      p+=l;
+    }
+  }
+  qb.Add("",1);
+
+  char fn[2048];
+  lstrcpyn_safe(fn,g_last_fn,sizeof(fn));
+
+  if (!WDL_ChooseFileForSave(hwndDlg, "Choose file for recording", NULL, fn,
+      (char*)qb.Get(), tab[bm][1] + 1, false, fn, sizeof(fn),
+      MAKEINTRESOURCE(IDD_SAVEOPTS),(void*)SaveOptsProc,
+#ifdef _WIN32
+      g_hInst
+#else
+      SWELL_curmodule_dialogresource_head
+#endif
+      ))
+    return;
+
+  DiscardPending();
+  WritePrivateProfileString("licecap","lastfn",fn,g_ini_file.Get());
+
+#ifdef _WIN32
+  if (g_prefs&16)
+  {
+    RegisterHotKey(hwndDlg, IDC_REC, MOD_CONTROL|MOD_ALT, 'P');
+  }
+#endif
+
+  g_rec_is_temp = false;
+  if (!BeginCapture(hwndDlg,fn))
+    MessageBoxA(hwndDlg,"Could not start the capture.","LICEcap",MB_OK|MB_ICONERROR);
+}
+
+static bool HasGifExt(const char *fn)
+{
+  const int l = (int)strlen(fn);
+  return l > 4 && !stricmp(fn+l-4,".gif");
+}
+
+static void DoSaveAs(HWND hwndDlg)
+{
+  if (!g_pending_unsaved || !g_pending_fn[0]) return;
+
+  char initdir[2048];
+  initdir[0] = 0;
+  if (g_last_save_fn[0])
+  {
+    lstrcpyn_safe(initdir,g_last_save_fn,sizeof(initdir));
+    const char *p = WDL_get_filepart(initdir);
+    if (p) initdir[p-initdir] = 0;
+  }
+
+  char defname[256];
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  snprintf(defname,sizeof(defname),"gifcam_%04d-%02d-%02d_%02d-%02d-%02d.gif",
+           st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+
+  char fn[2048];
+  fn[0] = 0;
+  static const char extlist[] = "GIF files (*.gif)\0*.gif\0All files (*.*)\0*.*\0";
+  if (!WDL_ChooseFileForSave(hwndDlg,"Save the animation as",initdir[0] ? initdir : NULL,defname,
+                             extlist,".gif",false,fn,sizeof(fn)))
+    return;
+
+  if (!HasGifExt(fn)) lstrcatn(fn,".gif",sizeof(fn));
+
+  if (!MoveFileExA(g_pending_fn,fn,MOVEFILE_REPLACE_EXISTING|MOVEFILE_COPY_ALLOWED))
+  {
+    char msg[2800];
+    snprintf(msg,sizeof(msg),"Could not save the animation to:\n%s\n\n(error %d)",fn,(int)GetLastError());
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
+    return;
+  }
+
+  lstrcpyn_safe(g_last_save_fn,fn,sizeof(g_last_save_fn));
+  g_pending_fn[0] = 0;
+  g_pending_unsaved = false;
+  g_rec_is_temp = false;
+  WritePrivateProfileString("licecap","lastsave",g_last_save_fn,g_ini_file.Get());
+  UpdateDimBoxes(hwndDlg);
+}
+
+static void ShowInFolder(HWND hwndDlg)
+{
+  const char *fn = g_pending_unsaved && g_pending_fn[0] ? g_pending_fn : g_last_save_fn;
+  if (!fn[0]) return;
+  char cmd[2600];
+  snprintf(cmd,sizeof(cmd),"explorer.exe /select,\"%s\"",fn);
+  WinExec(cmd,SW_SHOWNORMAL);
+  (void)hwndDlg;
+}
+
+static void ResizeCaptureArea(int cw, int ch)
+{
+  if (!g_hwnd || cw < MIN_SIZE_X || ch < MIN_SIZE_Y) return;
+  int oldw=0, oldh=0;
+  GetViewRectSize(&oldw,&oldh);
+  RECT r;
+  GetWindowRect(g_hwnd,&r);
+  int w = (r.right-r.left) + (cw-oldw);
+  int h = (r.bottom-r.top) + (ch-oldh);
+  SetWindowPos(g_hwnd,NULL,r.left,r.top,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
+}
+
+// ---------------------------------------------------------------------------
+// Customization dialog
+// ---------------------------------------------------------------------------
+
+static void CustomizeInit(HWND d)
+{
+  CheckRadioButton(d,IDC_FPS10,IDC_FPSCUSTOM,
+                   g_max_fps==10?IDC_FPS10 : g_max_fps==16?IDC_FPS16 : g_max_fps==30?IDC_FPS30 : IDC_FPSCUSTOM);
+  SetDlgItemInt(d,IDC_MAXFPS2,g_max_fps,FALSE);
+  EnableWindow(GetDlgItem(d,IDC_MAXFPS2), g_max_fps!=10 && g_max_fps!=16 && g_max_fps!=30);
+
+  CheckDlgButton(d,IDC_CAP_CURSOR,g_capture_cursor?BST_CHECKED:BST_UNCHECKED);
+  CheckDlgButton(d,IDC_CAP_CLICKS,(g_prefs&4)?BST_CHECKED:BST_UNCHECKED);
+  CheckDlgButton(d,IDC_CAP_TIME,(g_prefs&8)?BST_CHECKED:BST_UNCHECKED);
+  CheckDlgButton(d,IDC_CAP_STOPAFTER,(g_prefs&64)?BST_CHECKED:BST_UNCHECKED);
+
+  char buf[256];
+  snprintf(buf,sizeof(buf),"%.1f",(double)g_stop_after_msec/1000.0);
+  SetDlgItemTextA(d,IDC_STOPAFTER2,buf);
+  EnableWindow(GetDlgItem(d,IDC_STOPAFTER2),(g_prefs&64)!=0);
+
+  SetDlgItemInt(d,IDC_LOOPCNT2,g_gif_loopcount,FALSE);
+  CheckDlgButton(d,IDC_TRANSPARENT2,(g_prefs&32)?BST_CHECKED:BST_UNCHECKED);
+  CheckDlgButton(d,IDC_TITLEUSE2,(g_prefs&1)?BST_CHECKED:BST_UNCHECKED);
+  CheckDlgButton(d,IDC_BIGFONT2,(g_prefs&2)?BST_CHECKED:BST_UNCHECKED);
+
+  snprintf(buf,sizeof(buf),"%.1f",(double)g_titlems/1000.0);
+  SetDlgItemTextA(d,IDC_TITLEMS2,buf);
+  SetDlgItemTextA(d,IDC_TITLE2,g_title[0]?g_title:"Title");
+  EnableWindow(GetDlgItem(d,IDC_TITLE2),(g_prefs&1)!=0);
+  EnableWindow(GetDlgItem(d,IDC_TITLEMS2),(g_prefs&1)!=0);
+  EnableWindow(GetDlgItem(d,IDC_BIGFONT2),(g_prefs&1)!=0);
+
+  int cw=0, ch=0;
+  GetViewRectSize(&cw,&ch);
+  SetDlgItemInt(d,IDC_WINSIZE_W,cw,FALSE);
+  SetDlgItemInt(d,IDC_WINSIZE_H,ch,FALSE);
+}
+
+static void CustomizeDefaults(HWND d)
+{
+  CheckRadioButton(d,IDC_FPS10,IDC_FPSCUSTOM,IDC_FPS10);
+  SetDlgItemInt(d,IDC_MAXFPS2,10,FALSE);
+  EnableWindow(GetDlgItem(d,IDC_MAXFPS2),FALSE);
+  CheckDlgButton(d,IDC_CAP_CURSOR,BST_CHECKED);
+  CheckDlgButton(d,IDC_CAP_CLICKS,BST_CHECKED);
+  CheckDlgButton(d,IDC_CAP_TIME,BST_UNCHECKED);
+  CheckDlgButton(d,IDC_CAP_STOPAFTER,BST_UNCHECKED);
+  SetDlgItemTextA(d,IDC_STOPAFTER2,"10.0");
+  EnableWindow(GetDlgItem(d,IDC_STOPAFTER2),FALSE);
+  SetDlgItemInt(d,IDC_LOOPCNT2,0,FALSE);
+  CheckDlgButton(d,IDC_TRANSPARENT2,BST_CHECKED);
+  CheckDlgButton(d,IDC_TITLEUSE2,BST_UNCHECKED);
+  CheckDlgButton(d,IDC_BIGFONT2,BST_UNCHECKED);
+  SetDlgItemTextA(d,IDC_TITLEMS2,"1.8");
+  SetDlgItemTextA(d,IDC_TITLE2,"Title");
+  EnableWindow(GetDlgItem(d,IDC_TITLE2),FALSE);
+  EnableWindow(GetDlgItem(d,IDC_TITLEMS2),FALSE);
+  EnableWindow(GetDlgItem(d,IDC_BIGFONT2),FALSE);
+  SetDlgItemInt(d,IDC_WINSIZE_W,512,FALSE);
+  SetDlgItemInt(d,IDC_WINSIZE_H,512,FALSE);
+}
+
+static void CustomizeApply(HWND d)
+{
+  if (IsDlgButtonChecked(d,IDC_FPS10)) g_max_fps = 10;
+  else if (IsDlgButtonChecked(d,IDC_FPS16)) g_max_fps = 16;
+  else if (IsDlgButtonChecked(d,IDC_FPS30)) g_max_fps = 30;
+  else
+  {
+    BOOL t=FALSE;
+    int a=GetDlgItemInt(d,IDC_MAXFPS2,&t,FALSE);
+    if (t && a>=1 && a<=60) g_max_fps=a;
+  }
+
+  g_capture_cursor = IsDlgButtonChecked(d,IDC_CAP_CURSOR)!=0;
+  g_prefs = (g_prefs & ~(1|2|4|8|32|64))
+          | (IsDlgButtonChecked(d,IDC_CAP_CLICKS)?4:0)
+          | (IsDlgButtonChecked(d,IDC_CAP_TIME)?8:0)
+          | (IsDlgButtonChecked(d,IDC_TRANSPARENT2)?32:0)
+          | (IsDlgButtonChecked(d,IDC_CAP_STOPAFTER)?64:0)
+          | (IsDlgButtonChecked(d,IDC_TITLEUSE2)?1:0)
+          | (IsDlgButtonChecked(d,IDC_BIGFONT2)?2:0);
+
+  char buf[256];
+  GetDlgItemTextA(d,IDC_STOPAFTER2,buf,sizeof(buf));
+  if (buf[0]) g_stop_after_msec = (int)(atof(buf)*1000.0);
+  GetDlgItemTextA(d,IDC_TITLEMS2,buf,sizeof(buf));
+  if (buf[0]) g_titlems = (int)(atof(buf)*1000.0);
+  GetDlgItemTextA(d,IDC_TITLE2,g_title,sizeof(g_title));
+  if (!strcmp(g_title,"Title")) g_title[0]=0;
+
+  BOOL t=FALSE;
+  int a=GetDlgItemInt(d,IDC_LOOPCNT2,&t,FALSE);
+  if (t) g_gif_loopcount=(a>0&&a<65536)?a:0;
+
+  int cw = (int)GetDlgItemInt(d,IDC_WINSIZE_W,&t,FALSE);
+  if (!t) cw = 0;
+  int ch = (int)GetDlgItemInt(d,IDC_WINSIZE_H,&t,FALSE);
+  if (!t) ch = 0;
+  if (cw>=MIN_SIZE_X && ch>=MIN_SIZE_Y) ResizeCaptureArea(cw,ch);
+
+  UpdateDimBoxes(g_hwnd);
+}
+
+static WDL_DLGRET CustomizeProc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+  switch (msg)
+  {
+    case WM_INITDIALOG:
+      CustomizeInit(hwndDlg);
+      return 1;
+
+    case WM_COMMAND:
+      switch (LOWORD(wParam))
+      {
+        case IDC_FPS10: case IDC_FPS16: case IDC_FPS30: case IDC_FPSCUSTOM:
+          EnableWindow(GetDlgItem(hwndDlg,IDC_MAXFPS2),
+                       IsDlgButtonChecked(hwndDlg,IDC_FPSCUSTOM)!=0);
+          return 1;
+
+        case IDC_TITLEUSE2:
+        {
+          bool use = IsDlgButtonChecked(hwndDlg,IDC_TITLEUSE2)!=0;
+          EnableWindow(GetDlgItem(hwndDlg,IDC_TITLE2),use);
+          EnableWindow(GetDlgItem(hwndDlg,IDC_TITLEMS2),use);
+          EnableWindow(GetDlgItem(hwndDlg,IDC_BIGFONT2),use);
+          if (use) SetFocus(GetDlgItem(hwndDlg,IDC_TITLE2));
+        }
+        return 1;
+
+        case IDC_CAP_STOPAFTER:
+          EnableWindow(GetDlgItem(hwndDlg,IDC_STOPAFTER2),
+                       IsDlgButtonChecked(hwndDlg,IDC_CAP_STOPAFTER)!=0);
+          return 1;
+
+        case IDC_DEFAULTS:
+          CustomizeDefaults(hwndDlg);
+          return 1;
+
+        case IDOK:
+          CustomizeApply(hwndDlg);
+          EndDialog(hwndDlg,1);
+          return 1;
+
+        case IDCANCEL:
+          EndDialog(hwndDlg,0);
+          return 1;
+      }
+      return 0;
+  }
+  return 0;
+}
+
+static void ShowCustomization(HWND hwndDlg)
+{
+  DialogBox(g_hInst,MAKEINTRESOURCE(IDD_CUSTOMIZATION),hwndDlg,CustomizeProc);
+}
+
+static void SetFullScreen(HWND hwndDlg)
+{
+  RECT wr, scr;
+  GetWindowRect(hwndDlg,&wr);
+  my_getViewport(&scr,&wr,false);
+  SetWindowPos(hwndDlg,NULL,scr.left,scr.top,scr.right-scr.left,scr.bottom-scr.top,
+               SWP_NOZORDER|SWP_NOACTIVATE);
+}
+
+static void SetDefaultWindowSize(HWND hwndDlg)
+{
+  RECT wr;
+  GetWindowRect(hwndDlg,&wr);
+  SetWindowPos(hwndDlg,NULL,wr.left,wr.top,UI(512),UI(512),SWP_NOZORDER|SWP_NOACTIVATE);
+}
+
+static LRESULT CALLBACK LiceKbdHook(int code, WPARAM wParam, LPARAM lParam)
+{
+  if (code == HC_ACTION && g_hwnd && lParam)
+  {
+    const MSG *m = (const MSG*)lParam;
+    if (m->message == WM_KEYDOWN && m->hwnd &&
+        (m->hwnd == g_hwnd || IsChild(g_hwnd,m->hwnd)))
+    {
+      const bool ctrl = (GetKeyState(VK_CONTROL)&0x8000) != 0;
+      int cmd = 0;
+      if (ctrl && m->wParam=='N') cmd = IDM_NEW;
+      else if (ctrl && m->wParam=='S') cmd = IDM_SAVEAS;
+      else if (ctrl && m->wParam=='U') cmd = IDM_CUSTOMIZE;
+      else if (!ctrl && m->wParam==VK_F1) cmd = IDM_FPS10;
+      else if (!ctrl && m->wParam==VK_F2) cmd = IDM_FPS16;
+      else if (!ctrl && m->wParam==VK_F3) cmd = IDM_FPS30;
+      else if (!ctrl && m->wParam==VK_F4) cmd = IDM_PAUSE;
+      if (cmd)
+      {
+        PostMessage(g_hwnd,WM_COMMAND,(WPARAM)cmd,0);
+        return 1;
+      }
+    }
+  }
+  return CallNextHookEx(g_kbd_hook,code,wParam,lParam);
+}
+
 static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
   static POINT s_last_mouse;
   switch (uMsg)
   {
     case WM_INITDIALOG:
+    {
       g_hwnd=hwndDlg;
 #ifdef _WIN32
       SetClassLongPtr(hwndDlg,GCLP_HICON,(LPARAM)LoadIcon(GetModuleHandle(NULL),MAKEINTRESOURCE(IDI_ICON1)));
@@ -1097,35 +2049,26 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
       g_wndsize.init(hwndDlg);
-      g_wndsize.init_item(IDC_VIEWRECT,0,0,1,1);
-      g_wndsize.init_item(IDC_MAXFPS_LBL,0,1,0,1);
-      g_wndsize.init_item(IDC_MAXFPS,0,1,0,1);
-      g_wndsize.init_item(IDC_XSZ,0,1,0,1);
-      g_wndsize.init_item(IDC_YSZ,0,1,0,1);
-      g_wndsize.init_item(IDC_DIMLBL_1,0,1,0,1);
-      g_wndsize.init_item(IDC_DIMLBL,0,1,0,1);
-      g_wndsize.init_item(IDC_STATUS,0,1,1,1);
-      g_wndsize.init_item(IDC_REC,1,1,1,1);
-      g_wndsize.init_item(IDC_STOP,1,1,1,1);
-      g_wndsize.init_item(IDC_INSERT,1,1,1,1);
-      
-      ShowWindow(GetDlgItem(hwndDlg, IDC_INSERT), SW_HIDE);
-      SendMessage(hwndDlg,WM_SIZE,0,0);
+      UI_Init();
+      SendDlgItemMessage(hwndDlg, IDC_STATUS, WM_SETFONT, (WPARAM)(g_ui_font_small ? g_ui_font_small : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
 
       ++g_reent;
-
       g_gif_loopcount = GetPrivateProfileInt("licecap","gifloopcnt",g_gif_loopcount,g_ini_file.Get());
       g_max_fps = GetPrivateProfileInt("licecap", "maxfps", g_max_fps, g_ini_file.Get());
-      SetDlgItemInt(hwndDlg,IDC_MAXFPS,g_max_fps,FALSE);
+      g_prefs = GetPrivateProfileInt("licecap", "prefs", g_prefs, g_ini_file.Get());
+      g_titlems = GetPrivateProfileInt("licecap", "titlems", g_titlems, g_ini_file.Get());
+      g_stop_after_msec = GetPrivateProfileInt("licecap", "stopafter", g_stop_after_msec, g_ini_file.Get());
+      g_capture_cursor = GetPrivateProfileInt("licecap", "cursor", 1, g_ini_file.Get()) != 0;
+      g_always_on_top = GetPrivateProfileInt("licecap", "ontop", 0, g_ini_file.Get()) != 0;
+      GetPrivateProfileString("licecap","title","",g_title,sizeof(g_title),g_ini_file.Get());
+      GetPrivateProfileString("licecap","lastsave","",g_last_save_fn,sizeof(g_last_save_fn),g_ini_file.Get());
       --g_reent;
 
       Capture_Finish(hwndDlg);
 
-      UpdateCaption(hwndDlg);
-      UpdateStatusText(hwndDlg);
-
       SetTimer(hwndDlg,1,30,NULL);
 
+      bool restored=false;
       if (!GetAsyncKeyState(VK_SHIFT))
       {
         char buf[1024];
@@ -1145,15 +2088,24 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
         {
           EnsureNotCompletelyOffscreen((RECT*)a);
           SetWindowPos(hwndDlg,NULL,a[0],a[1],a[2]-a[0],a[3]-a[1],SWP_NOZORDER|SWP_NOACTIVATE);
+          restored=true;
         }
       }
+      if (!restored)
+      {
+        RECT wr;
+        GetWindowRect(hwndDlg,&wr);
+        SetWindowPos(hwndDlg,NULL,wr.left,wr.top,UI(512),UI(512),SWP_NOZORDER|SWP_NOACTIVATE);
+      }
+      if (g_always_on_top)
+        SetWindowPos(hwndDlg,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+
+      SendMessage(hwndDlg,WM_SIZE,0,0);
       UpdateDimBoxes(hwndDlg);
 
-      g_prefs = GetPrivateProfileInt("licecap", "prefs", g_prefs, g_ini_file.Get());
-      g_titlems = GetPrivateProfileInt("licecap", "titlems", g_titlems, g_ini_file.Get());
-      g_stop_after_msec = GetPrivateProfileInt("licecap", "stopafter", g_stop_after_msec, g_ini_file.Get());
-
-      GetPrivateProfileString("licecap","title","",g_title,sizeof(g_title),g_ini_file.Get());
+#ifdef _WIN32
+      g_kbd_hook = SetWindowsHookEx(WH_GETMESSAGE, LiceKbdHook, NULL, GetCurrentThreadId());
+#endif
 
 #ifdef VIDEO_ENCODER_SUPPORT
       g_cap_video_vbr = GetPrivateProfileInt("licecap", "video_vbr", g_cap_video_vbr, g_ini_file.Get());
@@ -1161,14 +2113,22 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
     return 1;
+    }
     case WM_DESTROY:
 
       Capture_Finish(hwndDlg);
+
+      KillTimer(hwndDlg,1);
+#ifdef _WIN32
+      if (g_kbd_hook) { UnhookWindowsHookEx(g_kbd_hook); g_kbd_hook = NULL; }
+#endif
+      DiscardPending();
 
       SaveConfig(hwndDlg);
 
       g_wndsize.init(hwndDlg);
       g_hwnd=NULL;
+      UI_Quit();
 #ifndef _WIN32
       SWELL_PostQuitMessage(0);
 #endif
@@ -1179,6 +2139,8 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       {     
         const DWORD now=timeGetTime();
         bool need_stop=false;
+
+        UpdateHoverState(hwndDlg);
 
         if (g_cap_state==1 && g_cap_bm && (!g_cap_prerolluntil || !WDL_TICKS_IN_RANGE_ENDING_AT(now,g_cap_prerolluntil,MAX_PREROLL_OR_DELAY)))
         {
@@ -1430,56 +2392,246 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
     break;
 #endif
 
+#ifdef _WIN32
+    case WM_ERASEBKGND:
+    {
+      HDC dc = (HDC)wParam;
+      RECT rc;
+      GetClientRect(hwndDlg,&rc);
+      FillRect(dc,&rc,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(WHITE_BRUSH));
+
+      RECT vr;
+      HWND view = GetDlgItem(hwndDlg,IDC_VIEWRECT);
+      if (view && GetWindowRect(view,&vr))
+      {
+        MapWindowPoints(NULL,hwndDlg,(LPPOINT)&vr,2);
+        HPEN pen = CreatePen(PS_SOLID,1,COL_SEP);
+        HGDIOBJ op = SelectObject(dc,pen);
+        const int x = vr.right + UI(1);
+        MoveToEx(dc,x,0,NULL);
+        LineTo(dc,x,rc.bottom);
+        SelectObject(dc,op);
+        DeleteObject(pen);
+      }
+      return 1;
+    }
+
+    case WM_DRAWITEM:
+      if (wParam)
+      {
+        DrawToolButton((LPDRAWITEMSTRUCT)lParam);
+        return 1;
+      }
+    break;
+
+    case WM_CTLCOLORSTATIC:
+    {
+      HDC dc = (HDC)wParam;
+      SetBkMode(dc,TRANSPARENT);
+      SetTextColor(dc,COL_TEXT_DIS);
+      return (LRESULT)(g_ui_bg_brush ? g_ui_bg_brush : GetStockObject(WHITE_BRUSH));
+    }
+
+    case WM_PARENTNOTIFY:
+      if (LOWORD(wParam) == WM_LBUTTONDOWN)
+      {
+        // lParam is in the child's coordinates here, so ask for the real cursor
+        POINT p;
+        GetCursorPos(&p);
+        g_arrow_click = AnyArrowZone(hwndDlg,p);
+      }
+    break;
+
+    case WM_CONTEXTMENU:
+    {
+      HWND child = (HWND)wParam;
+      if (child)
+      {
+        int id = GetDlgCtrlID(child);
+        if (id == IDC_REC || id == IDC_FRAME || id == IDC_EDITBTN || id == IDC_SAVE)
+        {
+          ShowToolMenu(hwndDlg,id);
+          return 1;
+        }
+      }
+    }
+    break;
+#endif
+
     case WM_COMMAND:
+      UIDbg("WM_COMMAND cmd=%d hi=%d arrow=%d state=%d", LOWORD(wParam), HIWORD(wParam), (int)g_arrow_click, g_cap_state);
       switch (LOWORD(wParam))
       {
-        case IDC_MAXFPS:
-          if (HIWORD(wParam) == EN_CHANGE && !g_reent)
-          {          
-            BOOL t;
-            int a = GetDlgItemInt(hwndDlg,IDC_MAXFPS,&t,FALSE);
-            if (t && a) g_max_fps = a;
+        case IDC_REC:
+          if (g_arrow_click)
+          {
+            ShowToolMenu(hwndDlg, IDC_REC);
+            g_arrow_click = false;
+          }
+          else if (!g_cap_state)
+          {
+            StartTempCapture(hwndDlg);
+          }
+          else if (g_cap_state == 1)
+          {
+            SendMessage(hwndDlg,WM_COMMAND,IDC_STOP,0);
+          }
+          else
+          {
+            TogglePause(hwndDlg);
           }
         break;
 
-        case IDC_XSZ:
-        case IDC_YSZ:
-          if (HIWORD(wParam) == EN_CHANGE && !g_cap_state && !g_reent)
+        case IDC_FRAME:
+          g_arrow_click = false;
+          ShowToolMenu(hwndDlg, IDC_FRAME);
+        break;
+
+        case IDC_EDITBTN:
+          g_arrow_click = false;
+          ShowToolMenu(hwndDlg, IDC_EDITBTN);
+        break;
+
+        case IDC_SAVE:
+          if (!g_arrow_click && g_pending_unsaved)
+            DoSaveAs(hwndDlg);
+          else
+            ShowToolMenu(hwndDlg, IDC_SAVE);
+          g_arrow_click = false;
+        break;
+
+        case IDM_NEW:
+          if (!g_cap_state)
           {
-            int ox, oy;
-            GetViewRectSize(&ox,&oy);
-
-            int nx=ox;
-            int ny=oy;
-
-            BOOL t;
-            int a=GetDlgItemInt(hwndDlg, IDC_XSZ, &t, FALSE);
-            if (t && a >= MIN_SIZE_X) nx=a;
-            a=GetDlgItemInt(hwndDlg, IDC_YSZ, &t, FALSE);
-            if (t && a >= MIN_SIZE_Y) ny=a;
-
-            if (nx != ox || ny != oy)
-            {
-              RECT r;
-              GetWindowRect(hwndDlg, &r);
-              int w=(r.right-r.left)+(nx-ox);
-              int h=abs(r.bottom-r.top)+(ny-oy);
-              SetWindowPos(hwndDlg, 0, 0, 0, w, h, SWP_NOZORDER|SWP_NOMOVE|SWP_NOACTIVATE);
-#ifndef _WIN32
-              void RefreshWindowShadows(HWND);
-              RefreshWindowShadows(hwndDlg);
-              
-#endif
-            }
+            DiscardPending();
+            UpdateDimBoxes(hwndDlg);
           }
+        break;
+
+        case IDM_FPS10:
+        case IDM_FPS16:
+        case IDM_FPS30:
+          if (!g_cap_state)
+          {
+            g_max_fps = LOWORD(wParam)==IDM_FPS10 ? 10 : LOWORD(wParam)==IDM_FPS16 ? 16 : 30;
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_FPS_CUSTOM:
+          if (!g_cap_state) ShowCustomization(hwndDlg);
+        break;
+
+        case IDM_CAPTURE_CURSOR:
+          if (!g_cap_state)
+          {
+            g_capture_cursor = !g_capture_cursor;
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_CAPTURE_CLICKS:
+          if (!g_cap_state)
+          {
+            g_prefs ^= 4;
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_CAPTURE_TIME:
+          if (!g_cap_state)
+          {
+            g_prefs ^= 8;
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_FULLSCREEN:
+          if (!g_cap_state) SetFullScreen(hwndDlg);
+        break;
+
+        case IDM_DEFAULT_SIZE:
+          if (!g_cap_state) SetDefaultWindowSize(hwndDlg);
+        break;
+
+        case IDM_ALWAYS_ON_TOP:
+          g_always_on_top = !g_always_on_top;
+          SetWindowPos(hwndDlg,g_always_on_top?HWND_TOPMOST:HWND_NOTOPMOST,0,0,0,0,
+                       SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+          UpdateDimBoxes(hwndDlg);
+        break;
+
+        case IDM_CUSTOMIZE:
+          if (!g_cap_state) ShowCustomization(hwndDlg);
+        break;
+
+        case IDM_PAUSE:
+          TogglePause(hwndDlg);
+        break;
+
+        case IDM_INSERT_TEXT:
+          if (g_cap_state == 2)
+          {
+            EnsurePauseSnapshot(hwndDlg);
+            DialogBox(g_hInst,MAKEINTRESOURCE(IDD_INSERT),hwndDlg,InsertProc);
+            g_last_frame_capture_time=timeGetTime();
+          }
+        break;
+
+        case IDM_INSERT_TITLE:
+          if (g_cap_state == 2 && g_title[0] && g_cap_bm_txt)
+          {
+            WriteTextFrame(g_title,g_titlems,true,g_cap_bm_txt->getWidth(),g_cap_bm_txt->getHeight());
+            g_last_frame_capture_time=timeGetTime();
+          }
+        break;
+
+        case IDM_CANCEL_REC:
+          if (g_cap_state)
+          {
+            SendMessage(hwndDlg,WM_COMMAND,IDC_STOP,0);
+            DiscardPending();
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_SAVEAS:
+          DoSaveAs(hwndDlg);
+        break;
+
+        case IDM_SHOWINFOLDER:
+          ShowInFolder(hwndDlg);
+        break;
+
+        case IDM_RECORD_TO_FILE:
+          if (!g_cap_state) RecordToFile(hwndDlg);
+        break;
+
+        case IDM_ABOUT:
+        {
+          char msg[1024];
+          snprintf(msg,sizeof(msg),
+            "LICEcap %s\n"
+            "GifCam-style capture window\n\n"
+            "Rec starts a capture right away and keeps it in a temporary GIF.\n"
+            "Save writes it wherever you want.\n\n"
+            "LICEcap is free software, licensed under the GNU GPL.",
+            LICECAP_VERSION);
+          MessageBoxA(hwndDlg,msg,"About LICEcap",MB_OK|MB_ICONINFORMATION);
+        }
         break;
 
         case IDC_STOP:
-          ShowWindow(GetDlgItem(hwndDlg, IDC_INSERT), SW_HIDE);
           g_insert_cnt=0;
           Capture_Finish(hwndDlg);
-          UpdateCaption(hwndDlg);
-          UpdateStatusText(hwndDlg);
+          if (g_rec_is_temp && g_last_fn[0])
+          {
+            lstrcpyn_safe(g_pending_fn,g_last_fn,sizeof(g_pending_fn));
+            g_pending_unsaved = true;
+          }
+          g_rec_is_temp = false;
+          UpdateDimBoxes(hwndDlg);
+          InvalidateRect(hwndDlg,NULL,TRUE);
 
 #ifdef _WIN32
           if (g_prefs&16)
@@ -1490,269 +2642,34 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
         break;
 
         case IDC_INSERT:
-          if (!g_cap_bm_txt)
+          if (g_cap_state == 2)
           {
-            int w,h;
-            GetViewRectSize(&w,&h);
-            g_cap_bm_txt = LICE_CreateSysBitmap(w,h);
-            LICE_Copy(g_cap_bm_txt, g_cap_bm);
+            EnsurePauseSnapshot(hwndDlg);
+            DialogBox(g_hInst,MAKEINTRESOURCE(IDD_INSERT),hwndDlg,InsertProc);
+            g_last_frame_capture_time=timeGetTime();
           }
-          DialogBox(g_hInst,MAKEINTRESOURCE(IDD_INSERT),hwndDlg,InsertProc);
-          g_last_frame_capture_time=timeGetTime();
         break;
-
-        case IDC_REC:
-
-          if (!g_cap_state)
-          {
-            //g_title[0]=0;
-            const char *tab[][2]={
-              { "GIF files (*.gif)\0*.gif\0", ".gif" },
-            #ifndef NO_LCF_SUPPORT
-              { "LiceCap files (*.lcf)\0*.lcf\0", ".lcf" },
-            #endif
-            #ifdef VIDEO_ENCODER_SUPPORT
-              { "WEBM files (*.webm)\0*.webm\0", ".webm" },
-            #endif
-              {NULL,NULL},
-            };
-
-            WDL_Queue qb;
-            int bm=0;
-            const int lfnlen=strlen(g_last_fn);
-            int x;
-            if (lfnlen >= 3) for (x=0;tab[x][0];x++)
-            {
-              const int tx1l = strlen(tab[x][1]);
-              if (lfnlen > tx1l && !stricmp(g_last_fn + lfnlen - tx1l, tab[x][1])) 
-              {
-                bm=x;
-                break;
-              }
-            }
-            for (x=bm;tab[x][0];x++)
-            {
-              const char *p=tab[x][0];
-              while (*p)
-              {
-                int l = strlen(p)+1;
-                qb.Add(p,l);
-                p+=l;
-              }
-            }
-            for (x=0;x<bm;x++)
-            {
-              const char *p=tab[x][0];
-              while (*p)
-              {
-                int l = strlen(p)+1;
-                qb.Add(p,l);
-                p+=l;
-              }
-            }
-
-            qb.Add("",1);
-
-            if (WDL_ChooseFileForSave(hwndDlg, "Choose file for recording", NULL, g_last_fn,
-              (char*)qb.Get(), tab[bm][1] + 1, false, g_last_fn, sizeof(g_last_fn),
-              MAKEINTRESOURCE(IDD_SAVEOPTS),(void*)SaveOptsProc, 
-#ifdef _WIN32
-                                      g_hInst
-#else
-                                      SWELL_curmodule_dialogresource_head
-#endif
-                                      ))
-            {
-              WritePrivateProfileString("licecap","lastfn",g_last_fn,g_ini_file.Get());
-
-#ifdef _WIN32
-              if (g_prefs&16)
-              {          
-                RegisterHotKey(hwndDlg, IDC_REC, MOD_CONTROL|MOD_ALT, 'P');               
-              }
-#endif
-
-              int w,h;
-              GetViewRectSize(&w,&h);
-              
-              delete g_cap_bm;
-#ifdef _WIN32
-              g_cap_bm = LICE_CreateSysBitmap(w,h);
-#else
-              delete g_cap_bm_inv;
-              g_cap_bm_inv = LICE_CreateSysBitmap(w,h);
-              g_cap_bm = new LICE_WrapperBitmap(g_cap_bm_inv->getBits(),g_cap_bm_inv->getWidth(),g_cap_bm_inv->getHeight(),g_cap_bm_inv->getRowSpan(),true);
-#endif
-
-              g_dotitle = ((g_prefs&1) && g_titlems);
-
-              if (strlen(g_last_fn)>4 && !stricmp(g_last_fn+strlen(g_last_fn)-4,".gif"))
-              {
-                void *ctx = LICE_WriteGIFBeginNoFrame(g_last_fn,w,h,(g_prefs&32) ? (-1)&~7 : 0,true);
-                if (ctx) g_cap_gif = new gif_encoder(ctx,g_gif_loopcount,0xf8);
-                g_cap_gif_lastsec_written = -1;
-
-#ifdef TEST_MULTIPLE_MODES
-                char tmp[1024];
-                sprintf(tmp,"%s.trans-nostats.gif",g_last_fn);
-                ctx = LICE_WriteGIFBeginNoFrame(tmp,w,h,(-1)&~(7|0x100),true);
-                if (ctx) g_cap_gif2 = new gif_encoder(ctx,g_gif_loopcount,0xf8);
-
-                sprintf(tmp,"%s.trans-0.gif",g_last_fn);
-                ctx = LICE_WriteGIFBeginNoFrame(tmp,w,h,0,true);
-                if (ctx) g_cap_gif3 = new gif_encoder(ctx,g_gif_loopcount,0xf8);
-#endif
-
-              }
-#ifdef VIDEO_ENCODER_SUPPORT
-              if (strlen(g_last_fn)>5 && !stricmp(g_last_fn+strlen(g_last_fn)-5,".webm"))
-              {
-#ifdef REAPER_LICECAP
-                static VideoEncoder *(*video_createEncoder2)(const char *);
-                if (!video_createEncoder2)
-                  *(void **)&video_createEncoder2 = reaperAPI_getfunc("video_createEncoder2");
-
-                if (video_createEncoder2) g_cap_video = video_createEncoder2("WEBM");
-#endif
-
-                if (g_cap_video)
-                {
-                  if (!g_cap_video->open(g_last_fn,"webm", "vp8", "vorbis", g_cap_video_vbr, 100, w,h, 30, g_cap_video_abr, 44100,2))
-                  {
-                    delete g_cap_video;
-                    g_cap_video=0;
-                  }
-                  else
-                  {
-                    strcpy(g_cap_video_ext,"WEBM");
-#ifdef REAPER_LICECAP
-                    s_audiohook_needsilence=0.0;
-                    g_cap_video_lastt=-1.0;
-                    s_audiohook_timepos=0.0;
-                    if (!s_audiohook_reg)
-                    {
-                      Audio_RegHardwareHook(true,&s_audiohook);
-                      s_audiohook_reg=true;
-                    }
-                    if (!s_audiothread)
-                    {
-                      // create thread
-                      unsigned id;
-                      s_audiothread = (HANDLE)_beginthreadex(NULL,0,audioEncodeThread,0,0,&id);
-                    }
-#endif
-
-                  }
-                }
-
-              }
-#endif
-
-#ifndef NO_LCF_SUPPORT
-              if (strlen(g_last_fn)>4 && !stricmp(g_last_fn+strlen(g_last_fn)-4,".lcf"))
-              {
-                g_cap_lcf = new LICECaptureCompressor(g_last_fn,w,h);
-                if (!g_cap_lcf->IsOpen())
-                {
-                  delete g_cap_lcf;
-                  g_cap_lcf = NULL;
-                }
-              }
-#endif
-
-              if (g_cap_gif
-#ifndef NO_LCF_SUPPORT
-                || g_cap_lcf
-#endif
-#ifdef VIDEO_ENCODER_SUPPORT
-                || g_cap_video
-#endif
-                )
-              {
-
-                if (g_dotitle)
-                  WriteTextFrame(g_title,g_titlems,true,w,h);
-
-#ifdef _WIN32
-                SaveRestoreRecRect(hwndDlg,false);
-
-                g_last_wndstyle = SetWindowLong(hwndDlg,GWL_STYLE,GetWindowLong(hwndDlg,GWL_STYLE)&~WS_THICKFRAME);
-                SetWindowPos(hwndDlg,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_DRAWFRAME|SWP_NOACTIVATE);
-
-                SaveRestoreRecRect(hwndDlg,true);
-#else
-                if (g_capwnd_levelsave < 0)
-                {
-                  g_capwnd_levelsave=SWELL_SetWindowLevel(hwndDlg,1000);
-                }
-                SWELL_SetWindowResizeable(hwndDlg,false);
-
-#ifdef __APPLE__
-                {
-                  s_has_async_offset=false;
-
-                  RECT r,r2;
-                  if (GetAsyncNSWindowRect(hwndDlg,&r))
-                  {
-                    GetWindowRect(GetDlgItem(hwndDlg,IDC_VIEWRECT),&r2);
-                    s_async_offset.x = r2.left - r.left;
-                    s_async_offset.y = r2.top - r.top;
-                    s_has_async_offset = true;
-                  }
-                }
-#endif
-#endif
-
-                SetDlgItemText(hwndDlg,IDC_REC,"[pause]");
-                EnableWindow(GetDlgItem(hwndDlg,IDC_STOP),1);
-
-                g_frate_valid=false;
-                g_frate_avg=0.0;
-                g_ms_written = 0;
-
-                g_last_frame_capture_time = g_cap_prerolluntil = timeGetTime()+PREROLL_AMT;
-                g_cap_state=1;
-                UpdateCaption(hwndDlg);
-                UpdateStatusText(hwndDlg);
-                UpdateDimBoxes(hwndDlg);
-              }
-            }
-          }
-          else if (g_cap_state==1)
-          {
-            g_pause_time = timeGetTime();
-            ShowWindow(GetDlgItem(hwndDlg, IDC_INSERT), SW_SHOWNA);
-            ShowWindow(GetDlgItem(hwndDlg,IDC_STATUS),SW_HIDE);
-            SetDlgItemText(hwndDlg,IDC_REC,"[unpause]");
-            g_cap_state=2;
-            UpdateCaption(hwndDlg);
-            UpdateStatusText(hwndDlg);
-          }
-          else // unpause!
-          {
-            delete g_cap_bm_txt;
-            g_cap_bm_txt = NULL;
-            g_insert_cnt=0;
-            ShowWindow(GetDlgItem(hwndDlg,IDC_STATUS),SW_SHOWNA);
-            ShowWindow(GetDlgItem(hwndDlg, IDC_INSERT), SW_HIDE);
-            SetDlgItemText(hwndDlg,IDC_REC,"[pause]");
-            g_last_frame_capture_time = g_cap_prerolluntil=timeGetTime()+PREROLL_AMT;
-            g_cap_state=1;
-            UpdateCaption(hwndDlg);
-            UpdateStatusText(hwndDlg);
-          }
-
-        break;
-#ifndef _WIN32
-        case IDCANCEL:
-          SendMessage(hwndDlg,WM_CLOSE,0,0);
-        return 1;
-#endif
       }
     break;
     case WM_CLOSE:
       if (!g_cap_state)
       {
+        if (g_pending_unsaved)
+        {
+          int r = MessageBoxA(hwndDlg,
+            "There is a recording that has not been saved yet.\n\nSave it now?",
+            "LICEcap",MB_YESNOCANCEL|MB_ICONQUESTION);
+          if (r == IDCANCEL) break;
+          if (r == IDYES)
+          {
+            DoSaveAs(hwndDlg);
+            if (g_pending_unsaved) break;
+          }
+          else
+          {
+            DiscardPending();
+          }
+        }
 
         #if defined(_WIN32) || defined(REAPER_LICECAP)
                 EndDialog(hwndDlg,0);
@@ -1760,14 +2677,24 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
                 DestroyWindow(hwndDlg);
         #endif
       }
+      else
+      {
+        int r = MessageBoxA(hwndDlg,
+          "A capture is in progress.\n\nStop it and continue?",
+          "LICEcap",MB_YESNO|MB_ICONQUESTION);
+        if (r == IDYES)
+        {
+          SendMessage(hwndDlg,WM_COMMAND,IDC_STOP,0);
+          PostMessage(hwndDlg,WM_CLOSE,0,0);
+        }
+      }
     break;
     case WM_GETMINMAXINFO:
       if (lParam)
       {
         LPMINMAXINFO l = (LPMINMAXINFO)lParam;
-        l->ptMinTrackSize.x = MIN_SIZE_X;
-        l->ptMinTrackSize.y = MIN_SIZE_Y;
-
+        l->ptMinTrackSize.x = UI(MIN_SIZE_X) + UI(UI_BTN_COL_W) + UI(4);
+        l->ptMinTrackSize.y = UI(MIN_SIZE_Y) + UI(4);
       }
     break;
 #ifndef _WIN32
@@ -1802,35 +2729,9 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 
       if (wParam != SIZE_MINIMIZED)
       {
-        g_wndsize.onResize();
-       
-
+        LayoutControls(hwndDlg);
 #ifdef _WIN32
-        RECT r,r2;
-        GetWindowRect(hwndDlg,&r);
-        GetWindowRect(GetDlgItem(hwndDlg,IDC_VIEWRECT),&r2);
-
-        r.right-=r.left;
-        r.bottom-=r.top;
-        r2.right-=r.left;
-        r2.bottom-=r.top;
-        r2.left-=r.left;
-        r2.top-=r.top;
-
-        r2.left++;
-        r2.top++;
-        r2.bottom--;
-        r2.right--;
-
-        r.left=r.top=0;
-        HRGN rgn=CreateRectRgnIndirect(&r);
-        HRGN rgn2=CreateRectRgnIndirect(&r2);
-        HRGN rgn3=CreateRectRgn(0,0,0,0);
-        CombineRgn(rgn3,rgn,rgn2,RGN_DIFF);
-
-        DeleteObject(rgn);
-        DeleteObject(rgn2);
-        SetWindowRgn(hwndDlg,rgn3,TRUE);
+        ApplyWindowRegion(hwndDlg);
 #endif
         UpdateDimBoxes(hwndDlg);
 
