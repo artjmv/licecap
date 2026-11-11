@@ -1,0 +1,14 @@
+# MSVC build outputs (licecap/licecap/licecap.vcxproj)
+licecap/licecap/x64/
+licecap/licecap/Win32/
+licecap/licecap/Debug_new/
+licecap/licecap/Release_new/
+licecap/licecap/licecap/
+*.user
+*.suo
+
+# Release package built by run-licecap.bat / MSBuild (not source)
+dist/
+
+# UI verification screenshots produced by _uicheck*.ps1
+_uicheck/
