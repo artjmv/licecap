@@ -1,4 +1,4 @@
-/*
+﻿/*
     LICEcap
     Copyright (C) 2010 Cockos Incorporated
 
@@ -21,9 +21,11 @@
 #include <stdio.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <commctrl.h> // SetWindowSubclass for the dark-mode dialog controls
 #include <process.h>
 #include <multimon.h>
 #include <shellapi.h>
+#include <shlobj.h>   // IFileOpenDialog / SHBrowseForFolder for the folder picker
 #else
 #include "../WDL/swell/swell.h"
 #endif
@@ -41,6 +43,7 @@
   #include "../jmde/reaper_plugin.h"
   #include "../jmde/video2/video_encoder.h"
   bool WDL_ChooseFileForSave(HWND parent, const char *text, const char *initialdir, const char *initialfile, const char *extlist,const char *defext,bool preservecwd,char *fn, int fnsize,const char *dlgid=NULL, void *dlgProc=NULL, void *hi=NULL);
+  char *WDL_ChooseFileForOpen(HWND parent, const char *text, const char *initialdir, const char *initialfile, const char *extlist,const char *defext,bool preservecwd,bool allowmul,const char *dlgid=NULL, void *dlgProc=NULL, void *hi=NULL);
 
   void *(*reaperAPI_getfunc)(const char *p);
   int (*Audio_RegHardwareHook)(bool isAdd, audio_hook_register_t *reg); // return >0 on success
@@ -78,12 +81,9 @@
 #include "licecap_version.h"
 
 #include "resource.h"
+#include "licecap_ui.h"
 
 HINSTANCE g_hInst;
-
-
-#define MIN_SIZE_X 160
-#define MIN_SIZE_Y 120
 
 
 
@@ -185,17 +185,21 @@ WDL_String g_ini_file;
 HWND g_hwnd;
 
 // ---- GifCam-style UI state ------------------------------------------------
-static char g_pending_fn[2048];    // finished capture that is not saved yet
-static bool g_pending_unsaved;     // g_pending_fn is a temporary file
+char g_pending_fn[2048];    // finished capture that is not saved yet
+bool g_pending_unsaved;     // g_pending_fn is a temporary file
 static bool g_rec_is_temp;         // current capture writes to a temp file
-static char g_last_save_fn[2048];  // last path used by "Save As"
-static bool g_capture_cursor = true;
-static bool g_always_on_top;
-static int g_ui_dpi = 96;
-static HFONT g_ui_font, g_ui_font_small;
-static HBRUSH g_ui_bg_brush;
-static int g_hot_btn, g_focus_btn;
+char g_last_save_fn[2048];  // last path used by "Save As"
+// GIF opened from disk for editing. The editor always works on a temporary
+// copy (that copy is the pending recording), so the original is never touched;
+// this path is only remembered to name and locate the file "Save As" offers.
+static char g_open_src_fn[2048];
+static char g_startup_gif[2048];   // GIF named on the command line, opened once
+bool g_capture_cursor = true;
+bool g_always_on_top;
 static HHOOK g_kbd_hook;
+
+// Theme state (g_dark_ui, g_ui_font, ...) lives in ui_theme.cpp and is
+// declared in licecap_ui.h, together with the rest of the UI modules.
 
 typedef struct {
   DWORD   cbSize;
@@ -486,7 +490,7 @@ static WDL_WndSizer g_wndsize;
 int g_capwnd_levelsave=-1;
 #endif
 
-static void GetViewRectSize(int *w, int *h)
+void GetViewRectSize(int *w, int *h)
 {
   RECT r={0,0,320,240};
   GetWindowRect(GetDlgItem(g_hwnd,IDC_VIEWRECT),&r);
@@ -502,6 +506,9 @@ static void GetViewRectSize(int *w, int *h)
 
 void UpdateCaption(HWND hwndDlg);
 void UpdateStatusText(HWND hwndDlg);
+
+// Preset state (g_preset_div, g_half_base_*) and the size presets live in
+// ui_presets.cpp; declared in licecap_ui.h.
 
 // GifCam keeps the size in the title bar and nothing else: the toolbar shows
 // the state. UpdateDimBoxes is the single entry point used all over the file.
@@ -535,6 +542,11 @@ LICE_IBitmap *g_cap_bm_txt;  // is a LICE_SysBitmap
 
 #define MAX_PREROLL_OR_DELAY (1000 * 60 * 60 * 24)
 
+// Busy state is UI-owned; only the atomic counters cross the worker boundary.
+static bool s_busy;
+static char s_busy_label[96];
+static volatile LONG s_busy_done, s_busy_total;
+
 void UpdateStatusText(HWND hwndDlg)
 {
   HWND st = GetDlgItem(hwndDlg, IDC_STATUS);
@@ -556,12 +568,42 @@ void UpdateStatusText(HWND hwndDlg)
   const int secs = (int)(g_ms_written/1000);
   snprintf(el,sizeof(el),"%d:%02d",secs/60,secs%60);
 
-  if (!g_cap_state)
+  char presetbuf[96];
+  const char *preset = PresetNameFor(x,y);
+  if (!preset && g_preset_div == 2)
+  {
+    const char *full = PresetNameFor(x*2,y*2);
+    if (full)
+    {
+      snprintf(presetbuf,sizeof(presetbuf),"%s (/2)",full);
+      preset = presetbuf;
+    }
+  }
+
+  if (s_busy)
+  {
+    char lab[sizeof(s_busy_label)];
+    lstrcpyn_safe(lab, s_busy_label, sizeof(lab));
+    CharUpperA(lab);
+    if (s_busy_total > 0)
+      snprintf(buf,sizeof(buf),"%s\n%d/%d",lab,s_busy_done,s_busy_total);
+    else if (s_busy_done > 0)
+      snprintf(buf,sizeof(buf),"%s\n%d frames",lab,s_busy_done);
+    else
+      snprintf(buf,sizeof(buf),"%s\n\nplease wait",lab);
+  }
+  else if (!g_cap_state)
   {
     if (g_pending_unsaved)
-      snprintf(buf,sizeof(buf),"RECORDED\n%s\n\nClick Save\nto keep it",el);
+    {
+      // An opened GIF is not a capture: the elapsed time it would show is 0:00.
+      if (g_open_src_fn[0]) snprintf(buf,sizeof(buf),"GIF LOADED\nNot saved\n\nEdit / Save\nNew clears");
+      else snprintf(buf,sizeof(buf),"RECORDED\n%s\nNot saved\n\nEdit / Save\nNew clears",el);
+    }
+    else if (preset)
+      snprintf(buf,sizeof(buf),"EMPTY\n%d x %d\n%s\n%d fps\n\nClick Rec",x,y,preset,g_max_fps);
     else
-      snprintf(buf,sizeof(buf),"%d x %d\n\n%d fps\n\nClick Rec\nto capture",x,y,g_max_fps);
+      snprintf(buf,sizeof(buf),"EMPTY\n%d x %d\n%d fps\n\nClick Rec",x,y,g_max_fps);
   }
   else if (g_cap_state == 2)
   {
@@ -581,6 +623,207 @@ void UpdateStatusText(HWND hwndDlg)
   if (strcmp(buf,oldtext)) SetWindowTextA(st,buf);
 }
 
+bool Busy_Active(void)
+{
+  return s_busy;
+}
+
+// Worker callbacks must never paint, pump messages or touch HWNDs.
+void Busy_Progress(void *, int done, int total)
+{
+  InterlockedExchange(&s_busy_done, done);
+  if (total > 0) InterlockedExchange(&s_busy_total, total);
+}
+
+struct BusyJob
+{
+  BusyWorkFn fn;
+  void *ctx;
+  bool ok;
+};
+
+static unsigned __stdcall Busy_Worker(void *arg)
+{
+  BusyJob *job = (BusyJob *)arg;
+  GIFEdit_SetProgress(Busy_Progress, NULL);
+  job->ok = job->fn(job->ctx);
+  GIFEdit_SetProgress(NULL, NULL);
+  return 0;
+}
+
+// Native progress themes do not reliably support the application's dark palette.
+// Keep the native range/position messages, but paint both modes with our colours.
+static LRESULT CALLBACK Busy_ProgressProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                         UINT_PTR id, DWORD_PTR data)
+{
+  if (msg == WM_ERASEBKGND) return 1;
+  if (msg == WM_PAINT)
+  {
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT r;
+    GetClientRect(hwnd, &r);
+    HBRUSH border = CreateSolidBrush(COL_BORDER);
+    FillRect(dc, &r, border);
+    DeleteObject(border);
+    InflateRect(&r, -UI(1), -UI(1));
+    HBRUSH track = CreateSolidBrush(COL_EDIT_BG);
+    FillRect(dc, &r, track);
+    DeleteObject(track);
+    RECT fill = r;
+    const int width = r.right - r.left;
+    if (GetWindowLongPtr(hwnd, GWL_STYLE) & PBS_MARQUEE)
+    {
+      const int segment = width / 4;
+      const int phase = (int)((GetTickCount() % 1600) * (width + segment) / 1600);
+      fill.left = r.left + phase - segment;
+      fill.right = fill.left + segment;
+      if (fill.left < r.left) fill.left = r.left;
+      if (fill.right > r.right) fill.right = r.right;
+    }
+    else
+    {
+      const int pos = (int)SendMessage(hwnd, PBM_GETPOS, 0, 0);
+      fill.right = fill.left + MulDiv(width, pos, 1000);
+    }
+    HBRUSH accent = CreateSolidBrush(COL_ACCENT);
+    FillRect(dc, &fill, accent);
+    DeleteObject(accent);
+    EndPaint(hwnd, &ps);
+    return 0;
+  }
+  if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, Busy_ProgressProc, id);
+  return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK Busy_WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+  if (msg == WM_ERASEBKGND)
+  {
+    RECT r;
+    GetClientRect(hwnd, &r);
+    FillRect((HDC)wp, &r, UI_BgBrush());
+    return 1;
+  }
+  if (msg == WM_CTLCOLORSTATIC)
+  {
+    SetBkMode((HDC)wp, TRANSPARENT);
+    SetBkColor((HDC)wp, COL_BG);
+    SetTextColor((HDC)wp, COL_TEXT);
+    return (LRESULT)UI_BgBrush();
+  }
+  // There is no unsafe "abort thread" operation: finish the temporary file
+  // before allowing the owner to close. Paint/move/accessibility still work.
+  if (msg == WM_CLOSE) return 0;
+  return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+bool Busy_Run(HWND owner, const char *label, int total, BusyWorkFn fn, void *ctx)
+{
+  if (s_busy || !fn) return false;
+  s_busy = true;
+  lstrcpyn_safe(s_busy_label, label, sizeof(s_busy_label));
+  InterlockedExchange(&s_busy_done, 0);
+  InterlockedExchange(&s_busy_total, total);
+
+  INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_PROGRESS_CLASS};
+  InitCommonControlsEx(&icc);
+  WNDCLASSA wc = {0};
+  wc.lpfnWndProc = Busy_WindowProc;
+  wc.hInstance = g_hInst;
+  wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+  wc.hbrBackground = NULL; // WM_ERASEBKGND always uses the current palette
+  wc.lpszClassName = "LICEcapProcessing";
+  RegisterClassA(&wc);
+  RECT r;
+  GetWindowRect(owner, &r);
+  const int w = UI(380), h = UI(166);
+  HWND popup = CreateWindowExA(WS_EX_DLGMODALFRAME, wc.lpszClassName,
+    "LICEcap - Processing", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    r.left + (r.right-r.left-w)/2, r.top + (r.bottom-r.top-h)/2,
+    w, h, owner, NULL, g_hInst, NULL);
+  if (!popup)
+  {
+    s_busy = false;
+    MessageBoxA(owner, "Could not create the processing window.", "LICEcap", MB_ICONERROR);
+    return false;
+  }
+  EnableMenuItem(GetSystemMenu(popup, FALSE), SC_CLOSE, MF_BYCOMMAND | MF_GRAYED);
+  HWND text = CreateWindowA("STATIC", label, WS_CHILD | WS_VISIBLE,
+    UI(18), UI(14), UI(340), UI(24), popup, (HMENU)1, g_hInst, NULL);
+  HWND detail = CreateWindowA("STATIC", "Please wait...", WS_CHILD | WS_VISIBLE,
+    UI(18), UI(80), UI(340), UI(24), popup, (HMENU)2, g_hInst, NULL);
+  HWND bar = CreateWindowExA(0, PROGRESS_CLASSA, "", WS_CHILD | WS_VISIBLE | PBS_MARQUEE,
+    UI(18), UI(48), UI(340), UI(20), popup, (HMENU)3, g_hInst, NULL);
+  UI_ThemeDialog(popup); // includes the native dark/light title bar
+  SetWindowSubclass(bar, Busy_ProgressProc, 1, 0);
+  SendMessage(text, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+  SendMessage(detail, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+  SendMessage(bar, PBM_SETRANGE32, 0, 1000);
+  SendMessage(bar, PBM_SETMARQUEE, TRUE, 35);
+  const BOOL wasEnabled = IsWindowEnabled(owner);
+  EnableWindow(owner, FALSE);
+  ShowWindow(popup, SW_SHOW);
+  UpdateWindow(popup); // visible BEFORE starting work, even for slow disk I/O
+
+  BusyJob job = { fn, ctx, false };
+  HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, Busy_Worker, &job, 0, NULL);
+  bool quit = false;
+  int quitCode = 0;
+  bool determinate = false;
+  DWORD started = GetTickCount();
+  while (thread && WaitForSingleObject(thread, 0) == WAIT_TIMEOUT)
+  {
+    const LONG done = InterlockedCompareExchange(&s_busy_done, 0, 0);
+    const LONG count = InterlockedCompareExchange(&s_busy_total, 0, 0);
+    char buf[160];
+    if (count > 0)
+    {
+      if (!determinate)
+      {
+        SendMessage(bar, PBM_SETMARQUEE, FALSE, 0);
+        SetWindowLongPtr(bar, GWL_STYLE, GetWindowLongPtr(bar, GWL_STYLE) & ~PBS_MARQUEE);
+        determinate = true;
+      }
+      SendMessage(bar, PBM_SETPOS, (WPARAM)((double)done * 1000 / count), 0);
+      snprintf(buf, sizeof(buf), "%d%% - %ld / %ld frames - %lus",
+        (int)((double)done * 100 / count), done, count, (GetTickCount()-started)/1000);
+    }
+    else snprintf(buf, sizeof(buf), "Processing... %lus", (GetTickCount()-started)/1000);
+    SetWindowTextA(detail, buf);
+    RedrawWindow(popup, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    UpdateStatusText(owner);
+    MsgWaitForMultipleObjects(1, &thread, FALSE, 50, QS_ALLINPUT);
+    MSG msg;
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+    {
+      if (msg.message == WM_QUIT) { quit = true; quitCode = (int)msg.wParam; continue; }
+      TranslateMessage(&msg);
+      DispatchMessage(&msg);
+    }
+  }
+  if (thread) CloseHandle(thread); // wait above is also the result memory barrier
+  if (wasEnabled) EnableWindow(owner, TRUE);
+  DestroyWindow(popup);
+  s_busy = false;
+  SetActiveWindow(owner);
+  UpdateStatusText(owner);
+  InvalidateRect(owner, NULL, TRUE);
+  if (!thread) MessageBoxA(owner, "Could not start the processing thread.", "LICEcap", MB_ICONERROR);
+  if (quit) PostQuitMessage(quitCode);
+  return thread && job.ok;
+}
+
+struct BusySaveJob { const char *src, *dst; DWORD error; };
+static bool Busy_Save(void *ctx)
+{
+  BusySaveJob *job = (BusySaveJob *)ctx;
+  const BOOL ok = MoveFileExA(job->src, job->dst,
+    MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
+  job->error = ok ? ERROR_SUCCESS : GetLastError();
+  return ok != FALSE;
+}
+
 
 void UpdateCaption(HWND hwndDlg)
 {
@@ -596,7 +839,16 @@ void UpdateCaption(HWND hwndDlg)
 
   if (!g_cap_state)
   {
-    snprintf(buf,sizeof(buf),"LICEcap %d x %d",x,y);
+    if (g_preset_div == 2) snprintf(buf,sizeof(buf),"LICEcap %d x %d  (/2)",x,y);
+    else snprintf(buf,sizeof(buf),"LICEcap %d x %d",x,y);
+    if (g_open_src_fn[0])
+    {
+      char nm[128];
+      lstrcpyn_safe(nm,WDL_get_filepart(g_open_src_fn),sizeof(nm));
+      strncat(buf," - ",sizeof(buf)-strlen(buf)-1);
+      strncat(buf,nm,sizeof(buf)-strlen(buf)-1);
+      strncat(buf," (opened)",sizeof(buf)-strlen(buf)-1);
+    }
     if (g_pending_unsaved) strncat(buf," - not saved",sizeof(buf)-strlen(buf)-1);
   }
   else if (g_cap_state == 2)
@@ -613,6 +865,11 @@ void UpdateCaption(HWND hwndDlg)
   }
 
   SetWindowTextA(hwndDlg,buf);
+
+  // the title lives in the custom caption drawn by the app
+  RECT cr;
+  UI_CaptionRect(hwndDlg,&cr);
+  InvalidateRect(hwndDlg,&cr,FALSE);
 }
 
 void SaveRestoreRecRect(HWND hwndDlg, bool restore)
@@ -716,6 +973,7 @@ WDL_DLGRET VideoOptionsProc(HWND hwndDlg, UINT Message, WPARAM wParam, LPARAM lP
   {
   case WM_INITDIALOG:
     {
+      UI_ThemeDialog(hwndDlg);
       SetDlgItemInt(hwndDlg, IDC_EDIT1, g_cap_video_vbr, FALSE);
       SetDlgItemInt(hwndDlg, IDC_EDIT2, g_cap_video_abr, FALSE);
     }
@@ -728,6 +986,27 @@ WDL_DLGRET VideoOptionsProc(HWND hwndDlg, UINT Message, WPARAM wParam, LPARAM lP
       EndDialog(hwndDlg,0);
     }
     break;
+#ifdef _WIN32
+  case WM_ERASEBKGND:
+    if (g_dark_ui)
+    {
+      HDC dc = (HDC)wParam;
+      RECT rc;
+      GetClientRect(hwndDlg,&rc);
+      FillRect(dc,&rc,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+      return 1;
+    }
+  break;
+  case WM_CTLCOLORSTATIC:
+  case WM_CTLCOLORBTN:
+  case WM_CTLCOLOREDIT:
+  case WM_CTLCOLORLISTBOX:
+  {
+    LRESULT res;
+    if (UI_DialogCtlColor(Message,wParam,&res)) return (WDL_DLGRET)res;
+  }
+  break;
+#endif
     case WM_DESTROY:
     {
       BOOL t = FALSE;
@@ -749,6 +1028,7 @@ static UINT_PTR CALLBACK SaveOptsProc(HWND hwndDlg, UINT msg, WPARAM wParam, LPA
   {
     case WM_INITDIALOG:
     {
+      UI_ThemeDialog(hwndDlg);
       //ShowWindow(GetDlgItem(hwndDlg, IDC_TIMELINE), SW_HIDE);
       if (g_prefs&1) CheckDlgButton(hwndDlg, IDC_TITLEUSE, BST_CHECKED);
       if (g_prefs&2) CheckDlgButton(hwndDlg, IDC_BIGFONT, BST_CHECKED);
@@ -846,6 +1126,27 @@ static UINT_PTR CALLBACK SaveOptsProc(HWND hwndDlg, UINT msg, WPARAM wParam, LPA
 #endif
       }
     return 0;
+#ifdef _WIN32
+    case WM_ERASEBKGND:
+      if (g_dark_ui)
+      {
+        HDC dc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwndDlg,&rc);
+        FillRect(dc,&rc,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return 1;
+      }
+    break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    {
+      LRESULT res;
+      if (UI_DialogCtlColor(msg,wParam,&res)) return (UINT_PTR)res;
+    }
+    break;
+#endif
   }
   return 0;
 }
@@ -974,6 +1275,7 @@ WDL_DLGRET InsertProc(HWND hwnd, UINT Message, WPARAM wParam, LPARAM lParam)
 	{
     case WM_INITDIALOG :
 		  {
+        UI_ThemeDialog(hwnd);
         char buf[256];
         sprintf(buf,"Insert (%d)",g_insert_cnt);
         SetDlgItemText(hwnd,IDOK,buf);
@@ -1022,6 +1324,27 @@ WDL_DLGRET InsertProc(HWND hwnd, UINT Message, WPARAM wParam, LPARAM lParam)
         break;
 			}
 		break;
+#ifdef _WIN32
+    case WM_ERASEBKGND:
+      if (g_dark_ui)
+      {
+        HDC dc = (HDC)wParam;
+        RECT rc;
+        GetClientRect(hwnd,&rc);
+        FillRect(dc,&rc,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+        return 1;
+      }
+    break;
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORLISTBOX:
+    {
+      LRESULT res;
+      if (UI_DialogCtlColor(Message,wParam,&res)) return (WDL_DLGRET)res;
+    }
+    break;
+#endif
 	}
 	return 0;
 }
@@ -1053,6 +1376,8 @@ void SaveConfig(HWND hwndDlg)
   WritePrivateProfileString("licecap","cursor",buf,g_ini_file.Get());
   sprintf(buf, "%d", g_always_on_top ? 1 : 0);
   WritePrivateProfileString("licecap","ontop",buf,g_ini_file.Get());
+  sprintf(buf, "%d", g_dark_ui ? 1 : 0);
+  WritePrivateProfileString("licecap","dark",buf,g_ini_file.Get());
   
   
 
@@ -1071,291 +1396,9 @@ void SaveConfig(HWND hwndDlg)
 // GifCam-style UI: flat side toolbar, drop-down menus, customization dialog
 ///////////////////////////////////////////////////////////////////////////////
 
-#define UI_BTN_COL_W 88
-#define UI_PAD       6
-#define UI_BTN_GAP   6
-#define UI_BTN_H     26
-
-#define COL_BG          RGB(250,250,250)
-#define COL_BTN         RGB(245,246,248)
-#define COL_BTN_HOT     RGB(234,244,253)
-#define COL_BTN_DOWN    RGB(214,232,250)
-#define COL_BTN_DIS     RGB(246,246,246)
-#define COL_BORDER      RGB(200,204,209)
-#define COL_BORDER_HOT  RGB(140,180,225)
-#define COL_ACCENT      RGB(47,127,209)
-#define COL_TEXT        RGB(40,40,40)
-#define COL_TEXT_DIS    RGB(175,175,175)
-#define COL_TEXT_HOT    RGB(20,90,170)
-#define COL_SEP         RGB(224,226,229)
-#define COL_REC         RGB(216,58,48)
-#define COL_REC_BG      RGB(253,236,235)
-#define COL_REC_BORDER  RGB(228,158,152)
 
 
-static int UI(int px)
-{
-  return MulDiv(px, g_ui_dpi > 0 ? g_ui_dpi : 96, 96);
-}
 
-static void UI_Init(void)
-{
-  HDC dc = GetDC(NULL);
-  if (dc)
-  {
-    int dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    ReleaseDC(NULL, dc);
-    if (dpi >= 72 && dpi <= 480) g_ui_dpi = dpi;
-  }
-  if (!g_ui_bg_brush) g_ui_bg_brush = CreateSolidBrush(COL_BG);
-  if (!g_ui_font)
-    g_ui_font = CreateFontA(-MulDiv(9,g_ui_dpi,72),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                            DEFAULT_PITCH|FF_DONTCARE,"Segoe UI");
-  if (!g_ui_font_small)
-    g_ui_font_small = CreateFontA(-MulDiv(8,g_ui_dpi,72),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,
-                            DEFAULT_PITCH|FF_DONTCARE,"Segoe UI");
-}
-
-static void UI_Quit(void)
-{
-  if (g_ui_font) { DeleteObject(g_ui_font); g_ui_font = NULL; }
-  if (g_ui_font_small) { DeleteObject(g_ui_font_small); g_ui_font_small = NULL; }
-  if (g_ui_bg_brush) { DeleteObject(g_ui_bg_brush); g_ui_bg_brush = NULL; }
-}
-
-static void LayoutControls(HWND hwndDlg)
-{
-  RECT rc;
-  GetClientRect(hwndDlg,&rc);
-
-  const int tw = UI(UI_BTN_COL_W);
-  const int pad = UI(UI_PAD);
-  const int gap = UI(UI_BTN_GAP);
-  const int bh = UI(UI_BTN_H);
-
-  int x = rc.right - tw + pad;
-  int w = tw - 2*pad;
-  if (w < UI(40)) w = UI(40);
-
-  int y = pad;
-  static const int ids[] = { IDC_REC, IDC_FRAME, IDC_EDITBTN, IDC_SAVE };
-  int i;
-  for (i = 0; i < 4; i++)
-  {
-    HWND b = GetDlgItem(hwndDlg, ids[i]);
-    if (b) MoveWindow(b, x, y, w, bh, TRUE);
-    y += bh + gap;
-  }
-
-  HWND st = GetDlgItem(hwndDlg, IDC_STATUS);
-  if (st)
-  {
-    int sh = rc.bottom - y - pad;
-    if (sh < UI(20)) sh = UI(20);
-    MoveWindow(st, x, y, w, sh, TRUE);
-  }
-
-  HWND vr = GetDlgItem(hwndDlg, IDC_VIEWRECT);
-  if (vr)
-  {
-    int cw = rc.right - tw - UI(2);
-    int ch = rc.bottom - UI(2);
-    if (cw < 1) cw = 1;
-    if (ch < 1) ch = 1;
-    SetWindowPos(vr, NULL, UI(1), UI(1), cw, ch, SWP_NOZORDER|SWP_NOACTIVATE);
-  }
-}
-
-// Cuts the capture area out of the window so the desktop shows through while
-// keeping the caption, the 1px frame and the toolbar clickable.
-static void ApplyWindowRegion(HWND hwndDlg)
-{
-  HWND vr = GetDlgItem(hwndDlg, IDC_VIEWRECT);
-  if (!vr) return;
-
-  RECT wr, vr2;
-  GetWindowRect(hwndDlg,&wr);
-  GetWindowRect(vr,&vr2);
-  OffsetRect(&vr2,-wr.left,-wr.top);
-  InflateRect(&vr2,-UI(1),-UI(1));
-
-  if (vr2.right <= vr2.left || vr2.bottom <= vr2.top)
-  {
-    SetWindowRgn(hwndDlg,NULL,TRUE);
-    return;
-  }
-
-  RECT full = {0,0,wr.right-wr.left,wr.bottom-wr.top};
-  HRGN rgn = CreateRectRgnIndirect(&full);
-  HRGN hole = CreateRectRgnIndirect(&vr2);
-  CombineRgn(rgn,rgn,hole,RGN_DIFF);
-  DeleteObject(hole);
-  SetWindowRgn(hwndDlg,rgn,TRUE);
-}
-
-static bool ButtonIsLive(int id)
-{
-  if (id == IDC_SAVE) return g_pending_unsaved;
-  return true;
-}
-
-static void DrawToolButton(LPDRAWITEMSTRUCT di)
-{
-  if (!di || di->CtlType != ODT_BUTTON) return;
-
-  HDC dc = di->hDC;
-  const int id = (int)di->CtlID;
-  RECT r = di->rcItem;
-  const bool hot = (g_hot_btn == id);
-  const bool focused = (GetFocus() == di->hwndItem);
-  const bool pressed = (di->itemState & ODS_SELECTED) != 0;
-  const bool split = (id == IDC_REC || id == IDC_SAVE);
-  const bool live = ButtonIsLive(id);
-  const bool rec = (id == IDC_REC && g_cap_state != 0);
-
-  FillRect(dc,&r,g_ui_bg_brush ? g_ui_bg_brush : (HBRUSH)GetStockObject(WHITE_BRUSH));
-
-  RECT br = r;
-  br.right--;
-  br.bottom--;
-
-  COLORREF fill, border, text;
-  if (rec)
-  {
-    fill = hot ? RGB(252,226,224) : COL_REC_BG;
-    border = focused ? COL_ACCENT : COL_REC_BORDER;
-    text = COL_REC;
-  }
-  else if (!live)
-  {
-    fill = COL_BTN_DIS;
-    border = COL_BORDER;
-    text = COL_TEXT_DIS;
-  }
-  else if (pressed)
-  {
-    fill = COL_BTN_DOWN;
-    border = COL_ACCENT;
-    text = COL_TEXT_HOT;
-  }
-  else if (hot)
-  {
-    fill = COL_BTN_HOT;
-    border = COL_BORDER_HOT;
-    text = COL_TEXT_HOT;
-  }
-  else
-  {
-    fill = COL_BTN;
-    border = focused ? COL_ACCENT : COL_BORDER;
-    text = COL_TEXT;
-  }
-
-  HBRUSH hb = CreateSolidBrush(fill);
-  HPEN hp = CreatePen(PS_SOLID,1,border);
-  HGDIOBJ ob = SelectObject(dc,hb);
-  HGDIOBJ op = SelectObject(dc,hp);
-  RoundRect(dc,br.left,br.top,br.right,br.bottom,UI(6),UI(6));
-  SelectObject(dc,ob);
-  SelectObject(dc,op);
-  DeleteObject(hb);
-  DeleteObject(hp);
-
-  SetBkMode(dc,TRANSPARENT);
-  HFONT f = g_ui_font ? g_ui_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-  HGDIOBJ of = SelectObject(dc,f);
-  SetTextColor(dc,text);
-
-  char label[64];
-  label[0] = 0;
-  GetWindowTextA(di->hwndItem,label,sizeof(label));
-  if (!label[0]) lstrcpyn_safe(label,id == IDC_REC ? "Rec" : id == IDC_FRAME ? "Frame" : id == IDC_EDITBTN ? "Edit" : "Save",sizeof(label));
-
-  RECT tr = r;
-  tr.left += UI(9);
-  tr.right -= split ? UI(16) : UI(7);
-  DrawTextA(dc,label,-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-
-  if (split)
-  {
-    int x = r.right - UI(16);
-    HPEN sp = CreatePen(PS_SOLID,1,hot ? RGB(202,222,242) : COL_BORDER);
-    HGDIOBJ osp = SelectObject(dc,sp);
-    MoveToEx(dc,x,r.top+UI(5),NULL);
-    LineTo(dc,x,r.bottom-UI(5));
-    SelectObject(dc,osp);
-    DeleteObject(sp);
-
-    int cx = r.right - UI(8);
-    int cy = (r.top + r.bottom - 1)/2 + UI(1);
-    POINT pts[3] = { {cx-UI(3),cy-UI(2)}, {cx+UI(3),cy-UI(2)}, {cx,cy+UI(2)} };
-    HBRUSH ab = CreateSolidBrush(text);
-    HGDIOBJ oab = SelectObject(dc,ab);
-    Polygon(dc,pts,3);
-    SelectObject(dc,oab);
-    DeleteObject(ab);
-  }
-
-  SelectObject(dc,of);
-}
-
-static void UpdateHoverState(HWND hwndDlg)
-{
-  int hot = 0;
-  if (GetForegroundWindow() == hwndDlg)
-  {
-    POINT p;
-    GetCursorPos(&p);
-    static const int ids[] = { IDC_REC, IDC_FRAME, IDC_EDITBTN, IDC_SAVE };
-    int i;
-    for (i = 0; i < 4; i++)
-    {
-      HWND b = GetDlgItem(hwndDlg, ids[i]);
-      RECT r;
-      if (b && IsWindowVisible(b) && GetWindowRect(b,&r) && PtInRect(&r,p))
-      {
-        hot = ids[i];
-        break;
-      }
-    }
-  }
-  if (hot != g_hot_btn)
-  {
-    HWND oldb = g_hot_btn ? GetDlgItem(hwndDlg,g_hot_btn) : NULL;
-    HWND newb = hot ? GetDlgItem(hwndDlg,hot) : NULL;
-    g_hot_btn = hot;
-    if (oldb) InvalidateRect(oldb,NULL,TRUE);
-    if (newb) InvalidateRect(newb,NULL,TRUE);
-  }
-
-  HWND f = GetFocus();
-  int fid = f ? GetDlgCtrlID(f) : 0;
-  if (fid != IDC_REC && fid != IDC_FRAME && fid != IDC_EDITBTN && fid != IDC_SAVE) fid = 0;
-  if (fid != g_focus_btn)
-  {
-    HWND oldb = g_focus_btn ? GetDlgItem(hwndDlg,g_focus_btn) : NULL;
-    g_focus_btn = fid;
-    if (oldb) InvalidateRect(oldb,NULL,TRUE);
-    if (f && fid) InvalidateRect(f,NULL,TRUE);
-  }
-}
-
-// Dialogs never receive WM_PARENTNOTIFY, so the split-button hit area is
-// resolved from the cursor position while the button is being clicked.
-static bool ArrowZoneNow(HWND hwndDlg, int id)
-{
-  HWND b = GetDlgItem(hwndDlg,id);
-  if (!b) return false;
-  if (id != IDC_REC && id != IDC_SAVE) return true;
-  RECT r;
-  POINT p;
-  if (!GetWindowRect(b,&r)) return false;
-  GetCursorPos(&p);
-  if (!PtInRect(&r,p)) return false;
-  return p.x >= r.right - UI(18);
-}
 
 static void ShowToolMenu(HWND hwndDlg, int id)
 {
@@ -1365,10 +1408,16 @@ static void ShowToolMenu(HWND hwndDlg, int id)
   const UINT g_idle = g_cap_state ? MF_GRAYED : 0;
   const bool custom_fps = (g_max_fps != 10 && g_max_fps != 16 && g_max_fps != 30);
 
+  // Settings is the single place for every preference: the Rec / Save / Presets
+  // menus only keep their own action instead of repeating "Customization...".
   if (id == IDC_REC)
   {
     AppendMenuA(m, MF_STRING|g_idle, IDM_NEW, "New\tCtrl+N");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_FULLSCREEN, "Full Screen");
+  }
+  else if (id == IDC_EDITBTN)
+  {
     AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==10?MF_CHECKED:0), IDM_FPS10, "10 FPS\tF1");
     AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==16?MF_CHECKED:0), IDM_FPS16, "16 FPS\tF2");
     AppendMenuA(m, MF_STRING|g_idle|(g_max_fps==30?MF_CHECKED:0), IDM_FPS30, "30 FPS\tF3");
@@ -1378,38 +1427,38 @@ static void ShowToolMenu(HWND hwndDlg, int id)
     AppendMenuA(m, MF_STRING|g_idle|((g_prefs&4)?MF_CHECKED:0), IDM_CAPTURE_CLICKS, "Highlight Mouse Clicks");
     AppendMenuA(m, MF_STRING|g_idle|((g_prefs&8)?MF_CHECKED:0), IDM_CAPTURE_TIME, "Show Elapsed Time");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|g_idle, IDM_FULLSCREEN, "Full Screen");
-    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
-  }
-  else if (id == IDC_FRAME)
-  {
-    AppendMenuA(m, MF_STRING|(g_cap_state?0:MF_GRAYED), IDM_PAUSE,
-                g_cap_state == 2 ? "Resume Recording\tF4" : "Pause Recording\tF4");
+    AppendMenuA(m, MF_STRING|(g_dark_ui?MF_CHECKED:0), IDM_DARK_THEME, "Dark Theme");
+    AppendMenuA(m, MF_STRING|(g_always_on_top?MF_CHECKED:0), IDM_ALWAYS_ON_TOP, "Always on Top");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|(g_cap_state==2?0:MF_GRAYED), IDM_INSERT_TEXT, "Insert Text Frame...");
-    AppendMenuA(m, MF_STRING|((g_cap_state==2 && g_title[0])?0:MF_GRAYED), IDM_INSERT_TITLE, "Insert Title Frame");
-    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|(g_cap_state?0:MF_GRAYED), IDM_CANCEL_REC, "Cancel Recording");
-  }
-  else if (id == IDC_EDITBTN)
-  {
     AppendMenuA(m, MF_STRING|g_idle, IDM_DEFAULT_SIZE, "Reset Window Size (512 x 512)");
     AppendMenuA(m, MF_STRING|g_idle, IDM_FULLSCREEN, "Full Screen");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|(g_always_on_top?MF_CHECKED:0), IDM_ALWAYS_ON_TOP, "Always on Top");
+    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Settings...\tCtrl+U");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
+    AppendMenuA(m, MF_STRING, IDM_ABOUT, "About LICEcap");
+  }
+  else if (id == IDC_EDITMODE)
+  {
+    // The label of the button does the first item (or opens a GIF when nothing
+    // is pending); the arrow is the way to the other one. While the editor is
+    // open the first item would close it, which the strip's Close already does.
+    const bool have = g_pending_unsaved && g_pending_fn[0] && !Editor_Active();
+    AppendMenuA(m, MF_STRING|(have?0:MF_GRAYED), IDM_EDIT_TOGGLE, "Edit Last Recording");
+    AppendMenuA(m, MF_STRING|g_idle, IDM_OPEN_GIF, "Open GIF to Edit...\tCtrl+O");
   }
   else if (id == IDC_SAVE)
   {
+    // The bookmark folders are not listed in the menu any more: with a
+    // recording waiting to be saved the arrow opens them as a drop-down list
+    // under the button (see the IDC_SAVE handler), so the menu keeps only the
+    // commands and the entry that reopens that same list.
     AppendMenuA(m, MF_STRING|(g_pending_unsaved?0:MF_GRAYED), IDM_SAVEAS, "Save As...\tCtrl+S");
     AppendMenuA(m, MF_STRING|((g_pending_unsaved||g_last_save_fn[0])?0:MF_GRAYED), IDM_SHOWINFOLDER, "Show in Folder");
     AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING|g_idle, IDM_BOOKMARKS_PANEL,
+                Bookmarks_Count() ? "Bookmarks..." : "Bookmarks... (none yet)");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
     AppendMenuA(m, MF_STRING|g_idle, IDM_RECORD_TO_FILE, "Record to File...");
-    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING|g_idle, IDM_CUSTOMIZE, "Customization...\tCtrl+U");
-    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuA(m, MF_STRING, IDM_ABOUT, "About LICEcap");
   }
   else
   {
@@ -1434,6 +1483,7 @@ static void ShowToolMenu(HWND hwndDlg, int id)
   if (cmd) SendMessage(hwndDlg,WM_COMMAND,(WPARAM)cmd,0);
 }
 
+
 // ---------------------------------------------------------------------------
 // capture / save flow (GifCam: record first, decide where to save later)
 // ---------------------------------------------------------------------------
@@ -1443,8 +1493,185 @@ static void DiscardPending(void)
   if (g_pending_unsaved && g_pending_fn[0]) DeleteFileA(g_pending_fn);
   g_pending_unsaved = false;
   g_pending_fn[0] = 0;
+  g_open_src_fn[0] = 0;
   g_rec_is_temp = false;
   UpdateDimBoxes(g_hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// open a GIF from disk in the timeline editor
+//
+// The file is never edited in place: it is copied to a temporary working GIF
+// that becomes the pending recording, so Apply rewrites the copy and Save
+// moves that wherever the user wants. The original GIF stays untouched.
+// ---------------------------------------------------------------------------
+static void FolderOfFile(const char *fn, char *dir, int dirsz)
+{
+  dir[0] = 0;
+  if (!fn || !fn[0]) return;
+  lstrcpyn_safe(dir,fn,dirsz);
+  const char *p = WDL_get_filepart(dir);
+  if (p && p != dir) dir[p-dir] = 0;
+  else dir[0] = 0;
+}
+
+// A GIF must start with the magic in the first six bytes. This is the cheap
+// check used before the picker's choice replaces anything.
+static bool LooksLikeGif(const char *fn)
+{
+  char head[6];
+  FILE *fp = fopen(fn,"rb");
+  if (!fp) return false;
+  const bool ok = fread(head,1,6,fp) == 6 &&
+                  (!_strnicmp(head,"GIF87a",6) || !_strnicmp(head,"GIF89a",6));
+  fclose(fp);
+  return ok;
+}
+
+static bool MakeOpenWorkingCopy(const char *src, char *dst, int dstsz)
+{
+  char dir[MAX_PATH];
+  dir[0] = 0;
+  const DWORD n = GetTempPathA(sizeof(dir),dir);
+  if (!n || n >= sizeof(dir)) lstrcpyn_safe(dir,".",sizeof(dir));
+
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  const int dl = (int)strlen(dir);
+  const char *sep = (dl && (dir[dl-1] == '\\' || dir[dl-1] == '/')) ? "" : "\\";
+
+  char base[MAX_PATH];
+  snprintf(base,sizeof(base),"LICEcap_edit_%04d%02d%02d_%02d%02d%02d",
+           st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+
+  int i;
+  for (i = 0; i < 1000; i++)
+  {
+    if (!i) snprintf(dst,dstsz,"%s%s%s.gif",dir,sep,base);
+    else snprintf(dst,dstsz,"%s%s%s_%d.gif",dir,sep,base,i);
+    if (GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES) break;
+  }
+  if (i >= 1000) return false;
+
+  if (!CopyFileA(src,dst,FALSE))
+  {
+    DeleteFileA(dst);
+    return false;
+  }
+  return true;
+}
+
+static bool OpenGifInEditor(HWND hwndDlg, const char *src)
+{
+  if (!src || !src[0]) return false;
+
+  // Refuse anything that is not a GIF before the pending recording is touched,
+  // so a wrong file never leaves the window claiming to have it open.
+  const DWORD attr = GetFileAttributesA(src);
+  if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+  {
+    char msg[2600];
+    snprintf(msg,sizeof(msg),"Could not open:\n%s",src);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
+    return false;
+  }
+  if (!LooksLikeGif(src))
+  {
+    char msg[2600];
+    snprintf(msg,sizeof(msg),"That file is not a GIF:\n%s",src);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
+    return false;
+  }
+
+  char tmp[2048];
+  if (!MakeOpenWorkingCopy(src,tmp,sizeof(tmp)))
+  {
+    char msg[2600];
+    snprintf(msg,sizeof(msg),"Could not read:\n%s",src);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
+    return false;
+  }
+
+  if (Editor_Active()) Editor_Close(hwndDlg);
+  DiscardPending();
+
+  lstrcpyn_safe(g_pending_fn,tmp,sizeof(g_pending_fn));
+  g_pending_unsaved = true;
+  lstrcpyn_safe(g_open_src_fn,src,sizeof(g_open_src_fn));
+  UpdateDimBoxes(hwndDlg);
+  InvalidateRect(hwndDlg,NULL,TRUE);
+
+  // Editor_Open reads the copy: a file that is not a GIF we can parse drops it
+  // and leaves nothing pending, so the original stays as it was.
+  if (!Editor_Open(hwndDlg))
+  {
+    DiscardPending();
+    InvalidateRect(hwndDlg,NULL,TRUE);
+    return false;
+  }
+  return true;
+}
+
+static void OpenGifToEdit(HWND hwndDlg)
+{
+  if (g_cap_state || Busy_Active()) return;
+
+  // Picker start folder: the GIF opened last, then the last Save As path, then
+  // the folder the drop-down under Save points at.
+  char initdir[2048];
+  if (g_open_src_fn[0]) FolderOfFile(g_open_src_fn,initdir,sizeof(initdir));
+  else if (g_last_save_fn[0]) FolderOfFile(g_last_save_fn,initdir,sizeof(initdir));
+  else
+  {
+    initdir[0] = 0;
+    const int bm = Bookmarks_LastUsed();
+    if (bm >= 0) lstrcpyn_safe(initdir,Bookmarks_Path(bm),sizeof(initdir));
+  }
+
+  static const char extlist[] = "GIF files (*.gif)\0*.gif\0All files (*.*)\0*.*\0";
+  char *picked = WDL_ChooseFileForOpen(hwndDlg,"Open a GIF to edit",
+                                       initdir[0] ? initdir : NULL,NULL,
+                                       extlist,".gif",false,false);
+  if (!picked || !picked[0])
+  {
+    if (picked) free(picked);
+    return;
+  }
+
+  char src[2048];
+  lstrcpyn_safe(src,picked,sizeof(src));
+  free(picked);
+
+  // One pending recording at a time: the replacement is decided here, after
+  // the picker, so cancelling the dialog never touches what is pending.
+  if (g_pending_unsaved && g_pending_fn[0])
+  {
+    if (MessageBoxA(hwndDlg,
+          "A recording that has not been saved yet will be replaced.\n\nDiscard it?",
+          "LICEcap",MB_YESNO|MB_ICONWARNING) != IDYES)
+      return;
+  }
+
+  OpenGifInEditor(hwndDlg,src);
+}
+
+// What clicking the label of the Edit button does. With a pending recording it
+// opens that one; with nothing recorded it goes straight to the file picker,
+// because a GIF from disk is the only thing there is to edit.
+static void EditButtonAction(HWND hwndDlg)
+{
+  if (g_cap_state || Busy_Active()) return;
+  if (Editor_Active())
+  {
+    Editor_Close(hwndDlg);
+    return;
+  }
+  if (g_pending_unsaved && g_pending_fn[0])
+  {
+    Editor_Open(hwndDlg);
+    return;
+  }
+  OpenGifToEdit(hwndDlg);
 }
 
 static bool EnsurePauseSnapshot(HWND hwndDlg)
@@ -1737,24 +1964,83 @@ static bool HasGifExt(const char *fn)
   return l > 4 && !stricmp(fn+l-4,".gif");
 }
 
+static void MakeAutoSaveName(char *dst, int dstsz)
+{
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  snprintf(dst,dstsz,"gifcam_%04d-%02d-%02d_%02d-%02d-%02d.gif",
+           st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+}
+
+// Name "Save As" proposes: a GIF opened from disk keeps its name with "-edit"
+// appended, so the result lands next to the original and says where it came
+// from. A fresh recording keeps the timestamp.
+static void MakeSaveNameForPending(char *dst, int dstsz)
+{
+  if (!g_open_src_fn[0])
+  {
+    MakeAutoSaveName(dst,dstsz);
+    return;
+  }
+
+  char base[128];
+  lstrcpyn_safe(base,WDL_get_filepart(g_open_src_fn),sizeof(base));
+  const int l = (int)strlen(base);
+  if (l > 4 && !stricmp(base+l-4,".gif")) base[l-4] = 0;
+  if (!base[0]) lstrcpyn_safe(base,"animation",sizeof(base));
+  snprintf(dst,dstsz,"%s-edit.gif",base);
+}
+
+// A save that lands inside a bookmarked folder makes it the folder the
+// drop-down under Save shows (and preselects next time the list opens).
+static void RememberBookmarkForFile(const char *fn)
+{
+  char dir[BOOKMARK_PATH_LEN];
+  const char *p;
+  int bm;
+  if (!fn || !fn[0]) return;
+  lstrcpyn_safe(dir,fn,sizeof(dir));
+  p = WDL_get_filepart(dir);
+  if (!p || p == dir) return;
+  dir[p-dir] = 0;
+  Bookmark_StripTrailingSlashes(dir);
+  bm = Bookmarks_IndexOf(dir);
+  if (bm >= 0) Bookmarks_SetLastUsed(bm);
+}
+
 static void DoSaveAs(HWND hwndDlg)
 {
   if (!g_pending_unsaved || !g_pending_fn[0]) return;
 
   char initdir[2048];
   initdir[0] = 0;
-  if (g_last_save_fn[0])
   {
-    lstrcpyn_safe(initdir,g_last_save_fn,sizeof(initdir));
-    const char *p = WDL_get_filepart(initdir);
-    if (p) initdir[p-initdir] = 0;
+    const int lastbm = Bookmarks_LastUsed();
+    if (g_open_src_fn[0])
+    {
+      // a GIF opened from disk is saved next to the file it came from
+      FolderOfFile(g_open_src_fn,initdir,sizeof(initdir));
+    }
+    else if (g_last_save_fn[0])
+    {
+      lstrcpyn_safe(initdir,g_last_save_fn,sizeof(initdir));
+      const char *p = WDL_get_filepart(initdir);
+      if (p) initdir[p-initdir] = 0;
+    }
+    else if (lastbm >= 0)
+    {
+      // start where the drop-down under Save says recordings go
+      lstrcpyn_safe(initdir,Bookmarks_Path(lastbm),sizeof(initdir));
+    }
+    else if (Bookmarks_Count() > 0)
+    {
+      // first run: start in the first bookmark instead of the default folder
+      lstrcpyn_safe(initdir,Bookmarks_Path(0),sizeof(initdir));
+    }
   }
 
   char defname[256];
-  SYSTEMTIME st;
-  GetLocalTime(&st);
-  snprintf(defname,sizeof(defname),"gifcam_%04d-%02d-%02d_%02d-%02d-%02d.gif",
-           st.wYear,st.wMonth,st.wDay,st.wHour,st.wMinute,st.wSecond);
+  MakeSaveNameForPending(defname,sizeof(defname));
 
   char fn[2048];
   fn[0] = 0;
@@ -1765,25 +2051,119 @@ static void DoSaveAs(HWND hwndDlg)
 
   if (!HasGifExt(fn)) lstrcatn(fn,".gif",sizeof(fn));
 
-  if (!MoveFileExA(g_pending_fn,fn,MOVEFILE_REPLACE_EXISTING|MOVEFILE_COPY_ALLOWED))
+  // copying to another volume, or into a network bookmark, can block for a
+  // while: say so before the call instead of leaving a dead window
+  BusySaveJob job = {g_pending_fn, fn, ERROR_NOT_ENOUGH_MEMORY};
+  const bool saved = Busy_Run(hwndDlg, "Saving recording...", 0, Busy_Save, &job);
+  const DWORD saveerr = job.error;
+
+  if (!saved)
   {
     char msg[2800];
-    snprintf(msg,sizeof(msg),"Could not save the animation to:\n%s\n\n(error %d)",fn,(int)GetLastError());
+    snprintf(msg,sizeof(msg),"Could not save the animation to:\n%s\n\n(error %d)",fn,(int)saveerr);
     MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
     return;
   }
 
   lstrcpyn_safe(g_last_save_fn,fn,sizeof(g_last_save_fn));
+  RememberBookmarkForFile(fn);
   g_pending_fn[0] = 0;
   g_pending_unsaved = false;
+  g_open_src_fn[0] = 0;
   g_rec_is_temp = false;
   WritePrivateProfileString("licecap","lastsave",g_last_save_fn,g_ini_file.Get());
   UpdateDimBoxes(hwndDlg);
 }
 
+// Blender-style "save here now": writes the pending temp recording into the
+// bookmarked folder using an auto-generated, unique file name.
+static bool SavePendingToFolder(HWND hwndDlg, const char *folder)
+{
+  char base[256], fn[2048];
+  int n, bl;
+
+  if (!g_pending_unsaved || !g_pending_fn[0] || !folder || !folder[0]) return false;
+
+  MakeAutoSaveName(base,sizeof(base));
+  bl = (int)strlen(base);
+  if (bl > 4 && !stricmp(base+bl-4,".gif")) base[bl-4] = 0;
+
+  for (n = 1; n < 1000; n++)
+  {
+    if (n == 1) snprintf(fn,sizeof(fn),"%s\\%s.gif",folder,base);
+    else snprintf(fn,sizeof(fn),"%s\\%s-%d.gif",folder,base,n);
+    if (GetFileAttributesA(fn) == INVALID_FILE_ATTRIBUTES) break;
+  }
+  if (n >= 1000) return false;
+
+  BusySaveJob job = {g_pending_fn, fn, ERROR_NOT_ENOUGH_MEMORY};
+  const bool saved = Busy_Run(hwndDlg, "Saving recording...", 0, Busy_Save, &job);
+  const DWORD saveerr = job.error;
+
+  if (!saved)
+  {
+    char msg[2800];
+    snprintf(msg,sizeof(msg),"Could not save the animation to:\n%s\n\n(error %d)",fn,(int)saveerr);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONERROR);
+    return false;
+  }
+
+  lstrcpyn_safe(g_last_save_fn,fn,sizeof(g_last_save_fn));
+  RememberBookmarkForFile(fn);
+  g_pending_fn[0] = 0;
+  g_pending_unsaved = false;
+  g_open_src_fn[0] = 0;
+  g_rec_is_temp = false;
+  WritePrivateProfileString("licecap","lastsave",g_last_save_fn,g_ini_file.Get());
+  UpdateDimBoxes(hwndDlg);
+  return true;
+}
+
+static void SaveToBookmark(HWND hwndDlg, int idx)
+{
+  DWORD attr;
+  if (idx < 0 || idx >= Bookmarks_Count()) return;
+  attr = GetFileAttributesA(Bookmarks_Path(idx));
+  if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+  {
+    char msg[1600];
+    snprintf(msg,sizeof(msg),"The bookmark folder no longer exists:\n%s\n\nRemove it from the list?",Bookmarks_Path(idx));
+    if (MessageBoxA(hwndDlg,msg,"LICEcap",MB_YESNO|MB_ICONQUESTION) == IDYES)
+      Bookmarks_Remove(idx);
+    return;
+  }
+  SavePendingToFolder(hwndDlg,Bookmarks_Path(idx));
+}
+
+static void AddBookmarkWithFeedback(HWND hwndDlg, const char *dir)
+{
+  const int r = Bookmarks_Add(dir);
+  if (r == 1)
+  {
+    char msg[1600];
+    snprintf(msg,sizeof(msg),"That folder is already in the bookmarks:\n%s",dir);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONINFORMATION);
+  }
+  else if (r == 3)
+  {
+    char msg[200];
+    snprintf(msg,sizeof(msg),"The bookmark list is full (%d).\nRemove one before adding another.",
+             LICECAP_MAX_BOOKMARKS);
+    MessageBoxA(hwndDlg,msg,"LICEcap",MB_OK|MB_ICONINFORMATION);
+  }
+  else if (r == 2)
+  {
+    MessageBoxA(hwndDlg,"That folder no longer exists.","LICEcap",MB_OK|MB_ICONWARNING);
+  }
+}
+
+
 static void ShowInFolder(HWND hwndDlg)
 {
-  const char *fn = g_pending_unsaved && g_pending_fn[0] ? g_pending_fn : g_last_save_fn;
+  // A GIF opened from disk is edited through a copy that lives in the temp
+  // folder; that is not the folder the user means, so show the original.
+  const char *fn = g_open_src_fn[0] && g_pending_unsaved && g_pending_fn[0] ? g_open_src_fn
+                 : g_pending_unsaved && g_pending_fn[0] ? g_pending_fn : g_last_save_fn;
   if (!fn[0]) return;
   char cmd[2600];
   snprintf(cmd,sizeof(cmd),"explorer.exe /select,\"%s\"",fn);
@@ -1791,191 +2171,18 @@ static void ShowInFolder(HWND hwndDlg)
   (void)hwndDlg;
 }
 
-static void ResizeCaptureArea(int cw, int ch)
+
+// "/" no esta en la misma tecla en todos los layouts (en-US es VK_OEM_2, en
+// es-ES/es-CR es Shift+7). VkKeyScanA('/') dice que tecla y si hace falta
+// Shift en el layout activo, asi que la tecla real del usuario siempre vale.
+static bool MsgIsLayoutSlashKey(WPARAM vk)
 {
-  if (!g_hwnd || cw < MIN_SIZE_X || ch < MIN_SIZE_Y) return;
-  int oldw=0, oldh=0;
-  GetViewRectSize(&oldw,&oldh);
-  RECT r;
-  GetWindowRect(g_hwnd,&r);
-  int w = (r.right-r.left) + (cw-oldw);
-  int h = (r.bottom-r.top) + (ch-oldh);
-  SetWindowPos(g_hwnd,NULL,r.left,r.top,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
-}
-
-// ---------------------------------------------------------------------------
-// Customization dialog
-// ---------------------------------------------------------------------------
-
-static void CustomizeInit(HWND d)
-{
-  CheckRadioButton(d,IDC_FPS10,IDC_FPSCUSTOM,
-                   g_max_fps==10?IDC_FPS10 : g_max_fps==16?IDC_FPS16 : g_max_fps==30?IDC_FPS30 : IDC_FPSCUSTOM);
-  SetDlgItemInt(d,IDC_MAXFPS2,g_max_fps,FALSE);
-  EnableWindow(GetDlgItem(d,IDC_MAXFPS2), g_max_fps!=10 && g_max_fps!=16 && g_max_fps!=30);
-
-  CheckDlgButton(d,IDC_CAP_CURSOR,g_capture_cursor?BST_CHECKED:BST_UNCHECKED);
-  CheckDlgButton(d,IDC_CAP_CLICKS,(g_prefs&4)?BST_CHECKED:BST_UNCHECKED);
-  CheckDlgButton(d,IDC_CAP_TIME,(g_prefs&8)?BST_CHECKED:BST_UNCHECKED);
-  CheckDlgButton(d,IDC_CAP_STOPAFTER,(g_prefs&64)?BST_CHECKED:BST_UNCHECKED);
-
-  char buf[256];
-  snprintf(buf,sizeof(buf),"%.1f",(double)g_stop_after_msec/1000.0);
-  SetDlgItemTextA(d,IDC_STOPAFTER2,buf);
-  EnableWindow(GetDlgItem(d,IDC_STOPAFTER2),(g_prefs&64)!=0);
-
-  SetDlgItemInt(d,IDC_LOOPCNT2,g_gif_loopcount,FALSE);
-  CheckDlgButton(d,IDC_TRANSPARENT2,(g_prefs&32)?BST_CHECKED:BST_UNCHECKED);
-  CheckDlgButton(d,IDC_TITLEUSE2,(g_prefs&1)?BST_CHECKED:BST_UNCHECKED);
-  CheckDlgButton(d,IDC_BIGFONT2,(g_prefs&2)?BST_CHECKED:BST_UNCHECKED);
-
-  snprintf(buf,sizeof(buf),"%.1f",(double)g_titlems/1000.0);
-  SetDlgItemTextA(d,IDC_TITLEMS2,buf);
-  SetDlgItemTextA(d,IDC_TITLE2,g_title[0]?g_title:"Title");
-  EnableWindow(GetDlgItem(d,IDC_TITLE2),(g_prefs&1)!=0);
-  EnableWindow(GetDlgItem(d,IDC_TITLEMS2),(g_prefs&1)!=0);
-  EnableWindow(GetDlgItem(d,IDC_BIGFONT2),(g_prefs&1)!=0);
-
-  int cw=0, ch=0;
-  GetViewRectSize(&cw,&ch);
-  SetDlgItemInt(d,IDC_WINSIZE_W,cw,FALSE);
-  SetDlgItemInt(d,IDC_WINSIZE_H,ch,FALSE);
-}
-
-static void CustomizeDefaults(HWND d)
-{
-  CheckRadioButton(d,IDC_FPS10,IDC_FPSCUSTOM,IDC_FPS10);
-  SetDlgItemInt(d,IDC_MAXFPS2,10,FALSE);
-  EnableWindow(GetDlgItem(d,IDC_MAXFPS2),FALSE);
-  CheckDlgButton(d,IDC_CAP_CURSOR,BST_CHECKED);
-  CheckDlgButton(d,IDC_CAP_CLICKS,BST_CHECKED);
-  CheckDlgButton(d,IDC_CAP_TIME,BST_UNCHECKED);
-  CheckDlgButton(d,IDC_CAP_STOPAFTER,BST_UNCHECKED);
-  SetDlgItemTextA(d,IDC_STOPAFTER2,"10.0");
-  EnableWindow(GetDlgItem(d,IDC_STOPAFTER2),FALSE);
-  SetDlgItemInt(d,IDC_LOOPCNT2,0,FALSE);
-  CheckDlgButton(d,IDC_TRANSPARENT2,BST_CHECKED);
-  CheckDlgButton(d,IDC_TITLEUSE2,BST_UNCHECKED);
-  CheckDlgButton(d,IDC_BIGFONT2,BST_UNCHECKED);
-  SetDlgItemTextA(d,IDC_TITLEMS2,"1.8");
-  SetDlgItemTextA(d,IDC_TITLE2,"Title");
-  EnableWindow(GetDlgItem(d,IDC_TITLE2),FALSE);
-  EnableWindow(GetDlgItem(d,IDC_TITLEMS2),FALSE);
-  EnableWindow(GetDlgItem(d,IDC_BIGFONT2),FALSE);
-  SetDlgItemInt(d,IDC_WINSIZE_W,512,FALSE);
-  SetDlgItemInt(d,IDC_WINSIZE_H,512,FALSE);
-}
-
-static void CustomizeApply(HWND d)
-{
-  if (IsDlgButtonChecked(d,IDC_FPS10)) g_max_fps = 10;
-  else if (IsDlgButtonChecked(d,IDC_FPS16)) g_max_fps = 16;
-  else if (IsDlgButtonChecked(d,IDC_FPS30)) g_max_fps = 30;
-  else
-  {
-    BOOL t=FALSE;
-    int a=GetDlgItemInt(d,IDC_MAXFPS2,&t,FALSE);
-    if (t && a>=1 && a<=60) g_max_fps=a;
-  }
-
-  g_capture_cursor = IsDlgButtonChecked(d,IDC_CAP_CURSOR)!=0;
-  g_prefs = (g_prefs & ~(1|2|4|8|32|64))
-          | (IsDlgButtonChecked(d,IDC_CAP_CLICKS)?4:0)
-          | (IsDlgButtonChecked(d,IDC_CAP_TIME)?8:0)
-          | (IsDlgButtonChecked(d,IDC_TRANSPARENT2)?32:0)
-          | (IsDlgButtonChecked(d,IDC_CAP_STOPAFTER)?64:0)
-          | (IsDlgButtonChecked(d,IDC_TITLEUSE2)?1:0)
-          | (IsDlgButtonChecked(d,IDC_BIGFONT2)?2:0);
-
-  char buf[256];
-  GetDlgItemTextA(d,IDC_STOPAFTER2,buf,sizeof(buf));
-  if (buf[0]) g_stop_after_msec = (int)(atof(buf)*1000.0);
-  GetDlgItemTextA(d,IDC_TITLEMS2,buf,sizeof(buf));
-  if (buf[0]) g_titlems = (int)(atof(buf)*1000.0);
-  GetDlgItemTextA(d,IDC_TITLE2,g_title,sizeof(g_title));
-  if (!strcmp(g_title,"Title")) g_title[0]=0;
-
-  BOOL t=FALSE;
-  int a=GetDlgItemInt(d,IDC_LOOPCNT2,&t,FALSE);
-  if (t) g_gif_loopcount=(a>0&&a<65536)?a:0;
-
-  int cw = (int)GetDlgItemInt(d,IDC_WINSIZE_W,&t,FALSE);
-  if (!t) cw = 0;
-  int ch = (int)GetDlgItemInt(d,IDC_WINSIZE_H,&t,FALSE);
-  if (!t) ch = 0;
-  if (cw>=MIN_SIZE_X && ch>=MIN_SIZE_Y) ResizeCaptureArea(cw,ch);
-
-  UpdateDimBoxes(g_hwnd);
-}
-
-static WDL_DLGRET CustomizeProc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-  switch (msg)
-  {
-    case WM_INITDIALOG:
-      CustomizeInit(hwndDlg);
-      return 1;
-
-    case WM_COMMAND:
-      switch (LOWORD(wParam))
-      {
-        case IDC_FPS10: case IDC_FPS16: case IDC_FPS30: case IDC_FPSCUSTOM:
-          EnableWindow(GetDlgItem(hwndDlg,IDC_MAXFPS2),
-                       IsDlgButtonChecked(hwndDlg,IDC_FPSCUSTOM)!=0);
-          return 1;
-
-        case IDC_TITLEUSE2:
-        {
-          bool use = IsDlgButtonChecked(hwndDlg,IDC_TITLEUSE2)!=0;
-          EnableWindow(GetDlgItem(hwndDlg,IDC_TITLE2),use);
-          EnableWindow(GetDlgItem(hwndDlg,IDC_TITLEMS2),use);
-          EnableWindow(GetDlgItem(hwndDlg,IDC_BIGFONT2),use);
-          if (use) SetFocus(GetDlgItem(hwndDlg,IDC_TITLE2));
-        }
-        return 1;
-
-        case IDC_CAP_STOPAFTER:
-          EnableWindow(GetDlgItem(hwndDlg,IDC_STOPAFTER2),
-                       IsDlgButtonChecked(hwndDlg,IDC_CAP_STOPAFTER)!=0);
-          return 1;
-
-        case IDC_DEFAULTS:
-          CustomizeDefaults(hwndDlg);
-          return 1;
-
-        case IDOK:
-          CustomizeApply(hwndDlg);
-          EndDialog(hwndDlg,1);
-          return 1;
-
-        case IDCANCEL:
-          EndDialog(hwndDlg,0);
-          return 1;
-      }
-      return 0;
-  }
-  return 0;
-}
-
-static void ShowCustomization(HWND hwndDlg)
-{
-  DialogBox(g_hInst,MAKEINTRESOURCE(IDD_CUSTOMIZATION),hwndDlg,CustomizeProc);
-}
-
-static void SetFullScreen(HWND hwndDlg)
-{
-  RECT wr, scr;
-  GetWindowRect(hwndDlg,&wr);
-  my_getViewport(&scr,&wr,false);
-  SetWindowPos(hwndDlg,NULL,scr.left,scr.top,scr.right-scr.left,scr.bottom-scr.top,
-               SWP_NOZORDER|SWP_NOACTIVATE);
-}
-
-static void SetDefaultWindowSize(HWND hwndDlg)
-{
-  RECT wr;
-  GetWindowRect(hwndDlg,&wr);
-  SetWindowPos(hwndDlg,NULL,wr.left,wr.top,UI(512),UI(512),SWP_NOZORDER|SWP_NOACTIVATE);
+  const SHORT scan = VkKeyScanA('/');
+  if (scan == -1) return false;
+  if ((vk & 0xFF) != (WPARAM)(scan & 0xFF)) return false;
+  const bool need_shift = ((scan >> 8) & 1) != 0;
+  const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+  return need_shift == shift;
 }
 
 static LRESULT CALLBACK LiceKbdHook(int code, WPARAM wParam, LPARAM lParam)
@@ -1987,10 +2194,23 @@ static LRESULT CALLBACK LiceKbdHook(int code, WPARAM wParam, LPARAM lParam)
         (m->hwnd == g_hwnd || IsChild(g_hwnd,m->hwnd)))
     {
       const bool ctrl = (GetKeyState(VK_CONTROL)&0x8000) != 0;
+      // The timeline editor owns the keyboard while it is open (space, arrows,
+      // A/B, Enter, Esc), so the toolbar shortcuts do not fire underneath it.
+      if (!ctrl && Editor_Active())
+      {
+        if (Editor_Key(g_hwnd, m->wParam))
+        {
+          // swallow it: otherwise it still reaches the focused button
+          ((MSG *)m)->message = WM_NULL;
+          return 1;
+        }
+      }
       int cmd = 0;
       if (ctrl && m->wParam=='N') cmd = IDM_NEW;
       else if (ctrl && m->wParam=='S') cmd = IDM_SAVEAS;
+      else if (ctrl && m->wParam=='O') cmd = IDM_OPEN_GIF;
       else if (ctrl && m->wParam=='U') cmd = IDM_CUSTOMIZE;
+      else if (!ctrl && (m->wParam==VK_OEM_2 || m->wParam==VK_DIVIDE || MsgIsLayoutSlashKey(m->wParam))) cmd = IDM_HALF_SIZE;
       else if (!ctrl && m->wParam==VK_F1) cmd = IDM_FPS10;
       else if (!ctrl && m->wParam==VK_F2) cmd = IDM_FPS16;
       else if (!ctrl && m->wParam==VK_F3) cmd = IDM_FPS30;
@@ -2014,6 +2234,19 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
     {
       g_hwnd=hwndDlg;
 #ifdef _WIN32
+      // DialogBox() adds a system caption to the template. The window keeps a
+      // region for the capture hole, and Windows draws classic (light) frames
+      // for region windows, so the caption is dropped and the app paints its
+      // own title bar in both themes.
+      {
+        LONG st = GetWindowLong(hwndDlg, GWL_STYLE);
+        st &= ~(WS_CAPTION | DS_MODALFRAME);
+        SetWindowLong(hwndDlg, GWL_STYLE, st);
+        SetWindowPos(hwndDlg, NULL, 0, 0, 0, 0,
+                     SWP_NOSIZE|SWP_NOMOVE|SWP_NOZORDER|SWP_FRAMECHANGED);
+      }
+#endif
+#ifdef _WIN32
       SetClassLongPtr(hwndDlg,GCLP_HICON,(LPARAM)LoadIcon(GetModuleHandle(NULL),MAKEINTRESOURCE(IDI_ICON1)));
 #elif defined(__APPLE__)
       extern void SWELL_SetWindowShadow(HWND, bool);
@@ -2025,7 +2258,10 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
       g_wndsize.init(hwndDlg);
+      g_dark_ui = GetPrivateProfileInt("licecap", "dark", 1, g_ini_file.Get()) != 0;
+      UI_ApplyAppMode();
       UI_Init();
+      UI_ThemeDialog(hwndDlg);
       SendDlgItemMessage(hwndDlg, IDC_STATUS, WM_SETFONT, (WPARAM)(g_ui_font_small ? g_ui_font_small : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
 
       ++g_reent;
@@ -2038,6 +2274,7 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       g_always_on_top = GetPrivateProfileInt("licecap", "ontop", 0, g_ini_file.Get()) != 0;
       GetPrivateProfileString("licecap","title","",g_title,sizeof(g_title),g_ini_file.Get());
       GetPrivateProfileString("licecap","lastsave","",g_last_save_fn,sizeof(g_last_save_fn),g_ini_file.Get());
+      Bookmarks_Load();
       --g_reent;
 
       Capture_Finish(hwndDlg);
@@ -2088,11 +2325,25 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       g_cap_video_abr = GetPrivateProfileInt("licecap", "video_abr", g_cap_video_abr, g_ini_file.Get());
 #endif
 
+      // A GIF named on the command line is opened once the window exists and
+      // its size is applied; the editor needs the finished layout.
+      if (g_startup_gif[0]) PostMessage(hwndDlg,WM_APP+1,0,0);
+
     return 1;
     }
+    case WM_APP+1:   // "licecap.exe some.gif": open it in the timeline editor
+      if (g_startup_gif[0])
+      {
+        char fn[2048];
+        lstrcpyn_safe(fn,g_startup_gif,sizeof(fn));
+        g_startup_gif[0] = 0;
+        OpenGifInEditor(hwndDlg,fn);
+      }
+    break;
     case WM_DESTROY:
 
       Capture_Finish(hwndDlg);
+      Editor_Shutdown();
 
       KillTimer(hwndDlg,1);
 #ifdef _WIN32
@@ -2114,8 +2365,23 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
     break;
 
     case WM_TIMER:
+      if (Busy_Active()) break;
+      if (wParam==2)
+      {
+        Editor_Tick(hwndDlg);
+        break;
+      }
       if (wParam==1)
       {     
+        static bool themed;
+        if (!themed)
+        {
+          // the window has to exist for the theme to reach its popup menus
+          themed = true;
+          UI_ThemeDialog(hwndDlg);
+          UI_SetDarkTitleBar(hwndDlg);
+          InvalidateRect(hwndDlg,NULL,TRUE);
+        }
         const DWORD now=timeGetTime();
         bool need_stop=false;
 
@@ -2372,6 +2638,19 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
 #ifdef _WIN32
+    case WM_PAINT:
+    {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hwndDlg,&ps);
+      if (dc)
+      {
+        if (Editor_Active()) Editor_Paint(hwndDlg,dc);
+        else UI_PaintCaption(hwndDlg,dc);
+      }
+      EndPaint(hwndDlg,&ps);
+    }
+    break;
+
     case WM_ERASEBKGND:
     {
       HDC dc = (HDC)wParam;
@@ -2387,7 +2666,7 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
         HPEN pen = CreatePen(PS_SOLID,1,COL_SEP);
         HGDIOBJ op = SelectObject(dc,pen);
         const int x = vr.right + UI(1);
-        MoveToEx(dc,x,0,NULL);
+        MoveToEx(dc,x,UI_CaptionHeight(),NULL);
         LineTo(dc,x,rc.bottom);
         SelectObject(dc,op);
         DeleteObject(pen);
@@ -2398,7 +2677,9 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
     case WM_DRAWITEM:
       if (wParam)
       {
-        DrawToolButton((LPDRAWITEMSTRUCT)lParam);
+        LPDRAWITEMSTRUCT di = (LPDRAWITEMSTRUCT)lParam;
+        if (di->CtlID == IDC_CLOSEBTN) DrawCaptionCloseButton(di);
+        else DrawToolButton(di);
         return 1;
       }
     break;
@@ -2417,9 +2698,14 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       if (child)
       {
         int id = GetDlgCtrlID(child);
-        if (id == IDC_REC || id == IDC_FRAME || id == IDC_EDITBTN || id == IDC_SAVE)
+        if (id == IDC_REC || id == IDC_EDITBTN || id == IDC_SAVE || id == IDC_EDITMODE)
         {
           ShowToolMenu(hwndDlg,id);
+          return 1;
+        }
+        if (id == IDC_PRESETS)
+        {
+          ShowPresetMenu(hwndDlg);
           return 1;
         }
       }
@@ -2428,9 +2714,11 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
 #endif
 
     case WM_COMMAND:
+      if (Busy_Active()) break;   // a GIF read/write is in flight: ignore input
       switch (LOWORD(wParam))
       {
         case IDC_REC:
+          if (Editor_Active()) break;   // the timeline owns the window
           if (ArrowZoneNow(hwndDlg,IDC_REC))
           {
             ShowToolMenu(hwndDlg, IDC_REC);
@@ -2449,24 +2737,62 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
           }
         break;
 
-        case IDC_FRAME:
-          ShowToolMenu(hwndDlg, IDC_FRAME);
-        break;
-
         case IDC_EDITBTN:
           ShowToolMenu(hwndDlg, IDC_EDITBTN);
         break;
 
+        case IDC_EDITMODE:
+          // Split button: the arrow drops the menu, the label edits.
+          if (ArrowZoneNow(hwndDlg,IDC_EDITMODE)) ShowToolMenu(hwndDlg, IDC_EDITMODE);
+          else EditButtonAction(hwndDlg);
+        break;
+
+        case IDM_EDIT_TOGGLE:
+          EditButtonAction(hwndDlg);
+        break;
+
+        case IDM_OPEN_GIF:
+          if (!g_cap_state) OpenGifToEdit(hwndDlg);
+        break;
+
+        case IDC_BOOKMARKDROP:
+          // Drop-down of the saved bookmark folders, right under the Save
+          // button. It opens with the folder used last already selected; a row
+          // click saves the pending recording there, or only picks the folder
+          // when there is nothing waiting to be saved.
+          if (!g_cap_state && !Editor_Active()) BookmarkPanel_Show(hwndDlg);
+        break;
+
+        case IDC_PRESETS:
+          ShowPresetMenu(hwndDlg);
+        break;
+
+        case IDC_CLOSEBTN:
+          SendMessage(hwndDlg,WM_CLOSE,0,0);
+        break;
+
         case IDC_SAVE:
           if (!ArrowZoneNow(hwndDlg,IDC_SAVE) && g_pending_unsaved)
+          {
             DoSaveAs(hwndDlg);
-          else
-            ShowToolMenu(hwndDlg, IDC_SAVE);
+            break;
+          }
+          // Drop-down list of bookmark folders right under the button: one
+          // click on a row saves the pending recording there. It only opens
+          // when there is something to save and at least one folder, so a row
+          // click always does something; otherwise the command menu comes up.
+          if (g_pending_unsaved && !Editor_Active() && Bookmarks_Count() > 0)
+          {
+            BookmarkPanel_Show(hwndDlg);
+            break;
+          }
+          ShowToolMenu(hwndDlg, IDC_SAVE);
         break;
 
         case IDM_NEW:
           if (!g_cap_state)
           {
+            if (Editor_Active()) Editor_Close(hwndDlg);
             DiscardPending();
             UpdateDimBoxes(hwndDlg);
           }
@@ -2525,6 +2851,10 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
           UpdateDimBoxes(hwndDlg);
         break;
 
+        case IDM_DARK_THEME:
+          UI_SetDarkMode(hwndDlg, !g_dark_ui);
+        break;
+
         case IDM_CUSTOMIZE:
           if (!g_cap_state) ShowCustomization(hwndDlg);
         break;
@@ -2567,6 +2897,31 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
           ShowInFolder(hwndDlg);
         break;
 
+        case IDM_BOOKMARKS_PANEL:
+          if (!g_cap_state) BookmarkPanel_Show(hwndDlg);
+        break;
+
+        case IDM_BOOKMARK_ADD:
+          if (!g_cap_state)
+          {
+            char dir[BOOKMARK_PATH_LEN];
+            if (Bookmark_LastSaveFolder(dir,sizeof(dir)))
+              AddBookmarkWithFeedback(hwndDlg,dir);
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
+        case IDM_BOOKMARK_PICK:
+          if (!g_cap_state)
+          {
+            char dir[BOOKMARK_PATH_LEN], start[BOOKMARK_PATH_LEN];
+            const bool have_start = Bookmark_LastSaveFolder(start,sizeof(start));
+            if (Bookmark_PickFolder(hwndDlg,have_start?start:NULL,dir,sizeof(dir)))
+              AddBookmarkWithFeedback(hwndDlg,dir);
+            UpdateDimBoxes(hwndDlg);
+          }
+        break;
+
         case IDM_RECORD_TO_FILE:
           if (!g_cap_state) RecordToFile(hwndDlg);
         break;
@@ -2578,7 +2933,8 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
             "LICEcap %s\n"
             "GifCam-style capture window\n\n"
             "Rec starts a capture right away and keeps it in a temporary GIF.\n"
-            "Save writes it wherever you want.\n\n"
+            "Save writes it wherever you want.\n"
+            "Edit trims the last recording, or a GIF opened from disk (Ctrl+O).\n\n"
             "LICEcap is free software, licensed under the GNU GPL.",
             LICECAP_VERSION);
           MessageBoxA(hwndDlg,msg,"About LICEcap",MB_OK|MB_ICONINFORMATION);
@@ -2618,9 +2974,45 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
           if (!g_cap_state) SendMessage(hwndDlg,WM_CLOSE,0,0);
         break;
 
+        default:
+          {
+            const int cmd = LOWORD(wParam);
+            if (cmd >= IDM_PRESET_FIRST && cmd < IDM_PRESET_FIRST + PresetCount())
+            {
+              ApplyPreset(hwndDlg, cmd - IDM_PRESET_FIRST);
+            }
+            else if (cmd == IDM_HALF_SIZE)
+            {
+              // Resizing during a capture would break the GIF, same as the
+              // greyed-out presets while recording.
+              if (!g_cap_state) SetPresetDiv(hwndDlg, g_preset_div == 2 ? 1 : 2);
+            }
+            else if (cmd >= IDM_BOOKMARK_FIRST && cmd < IDM_BOOKMARK_FIRST + Bookmarks_Count())
+            {
+              SaveToBookmark(hwndDlg, cmd - IDM_BOOKMARK_FIRST);
+            }
+            else if (cmd >= IDM_BOOKMARK_REMOVE_FIRST && cmd < IDM_BOOKMARK_REMOVE_FIRST + Bookmarks_Count())
+            {
+              Bookmarks_Remove(cmd - IDM_BOOKMARK_REMOVE_FIRST);
+              UpdateDimBoxes(hwndDlg);
+            }
+            else if (cmd >= IDM_BOOKMARK_UP_FIRST && cmd < IDM_BOOKMARK_UP_FIRST + Bookmarks_Count())
+            {
+              Bookmarks_Move(cmd - IDM_BOOKMARK_UP_FIRST, -1);
+              UpdateDimBoxes(hwndDlg);
+            }
+            else if (cmd >= IDM_BOOKMARK_DOWN_FIRST && cmd < IDM_BOOKMARK_DOWN_FIRST + Bookmarks_Count())
+            {
+              Bookmarks_Move(cmd - IDM_BOOKMARK_DOWN_FIRST, 1);
+              UpdateDimBoxes(hwndDlg);
+            }
+          }
+        break;
       }
     break;
     case WM_CLOSE:
+      if (Busy_Active()) return 1;
+      BookmarkPanel_Close();
       if (!g_cap_state)
       {
         if (g_pending_unsaved)
@@ -2662,8 +3054,8 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       if (lParam)
       {
         LPMINMAXINFO l = (LPMINMAXINFO)lParam;
-        l->ptMinTrackSize.x = UI(MIN_SIZE_X) + UI(UI_BTN_COL_W) + UI(4);
-        l->ptMinTrackSize.y = UI(MIN_SIZE_Y) + UI(4);
+        l->ptMinTrackSize.x = UI(MIN_SIZE_X) + UI(UI_BTN_COL_W) + UI(8);
+        l->ptMinTrackSize.y = UI(150) + UI_CaptionHeight();
       }
     break;
 #ifndef _WIN32
@@ -2709,6 +3101,57 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
       }
     break;
 #if _WIN32
+    // The editor strip and its preview are client areas, not the draggable
+    // custom caption the rest of the window uses.
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+      if (Editor_Active() &&
+          Editor_Mouse(hwndDlg, WM_LBUTTONDOWN, (short)LOWORD(lParam), (short)HIWORD(lParam)))
+      {
+        SetFocus(hwndDlg);
+        // Close/Apply can leave edit mode inside Editor_Mouse. Do not capture
+        // the mouse afterwards: there would be no active editor to release it.
+        if (Editor_Active()) SetCapture(hwndDlg);
+        return 1;
+      }
+    break;
+
+    case WM_MOUSEMOVE:
+      if (Editor_Active() &&
+          Editor_Mouse(hwndDlg, WM_MOUSEMOVE, (short)LOWORD(lParam), (short)HIWORD(lParam)))
+        return 1;
+    break;
+
+    case WM_LBUTTONUP:
+      if (GetCapture() == hwndDlg) ReleaseCapture();
+      if (Editor_Active())
+      {
+        const bool handled = Editor_Mouse(hwndDlg, WM_LBUTTONUP,
+                                          (short)LOWORD(lParam), (short)HIWORD(lParam));
+        if (handled) return 1;
+      }
+    break;
+
+    case WM_SETCURSOR:
+      if (Busy_Active())
+      {
+        SetCursor(LoadCursor(NULL, IDC_WAIT));
+        return 1;
+      }
+      if (Editor_Active() && LOWORD(lParam) == HTCLIENT)
+      {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwndDlg, &pt);
+        const int cur = Editor_Cursor(hwndDlg, pt.x, pt.y);
+        if (cur != EDITOR_CUR_NONE)
+        {
+          SetCursor(LoadCursor(NULL, cur == EDITOR_CUR_HANDLE ? IDC_SIZEWE : IDC_HAND));
+          return 1;
+        }
+      }
+    break;
+
     case WM_NCHITTEST: /* allow dragging the dialog without mouse capture */
         {
             POINT pt;
@@ -2718,6 +3161,11 @@ static WDL_DLGRET liceCapMainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM
             ScreenToClient(hwndDlg, &pt);
             if (PtInRect(&rc, pt))
             {
+                if (Editor_Active() && Editor_HitTest(hwndDlg, pt.x, pt.y))
+                {
+                    SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, HTCLIENT);
+                    return 1;
+                }
                 SetWindowLongPtr(hwndDlg, DWLP_MSGRESULT, HTCAPTION);
                 return 1;
             }
@@ -2781,6 +3229,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
 
   GetPrivateProfileString("licecap","lastfn","",g_last_fn,sizeof(g_last_fn),g_ini_file.Get());
+  g_dark_ui = GetPrivateProfileInt("licecap", "dark", 1, g_ini_file.Get()) != 0;
+  UI_ApplyAppMode();
+
+  // "licecap.exe D:\path\anim.gif" opens that GIF in the timeline editor, the
+  // same thing the Edit button offers.
+  if (lpCmdLine)
+  {
+    char arg[2048];
+    int n = 0;
+    const char *p = lpCmdLine;
+    while (*p == ' ' || *p == '\t') p++;
+    const char quote = (*p == '"') ? '"' : 0;
+    if (quote) p++;
+    while (*p && n < (int)sizeof(arg)-1 && (quote ? *p != quote : (*p != ' ' && *p != '\t')))
+      arg[n++] = *p++;
+    arg[n] = 0;
+    if (n > 0)
+    {
+      char full[2048];
+      if (GetFullPathNameA(arg,sizeof(full),full,NULL) && full[0])
+        lstrcpyn_safe(g_startup_gif,full,sizeof(g_startup_gif));
+      else
+        lstrcpyn_safe(g_startup_gif,arg,sizeof(g_startup_gif));
+    }
+  }
 
   g_hInst = hInstance;
   DialogBox(hInstance,MAKEINTRESOURCE(IDD_DIALOG1),GetDesktopWindow(),liceCapMainProc);

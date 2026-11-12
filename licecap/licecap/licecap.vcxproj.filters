@@ -30,6 +30,24 @@
     <ClCompile Include="..\licecap_ui.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\ui_theme.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ui_draw.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ui_bookmarks.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ui_presets.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ui_gifedit.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ui_editor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\WDL\filebrowse.cpp">
       <Filter>Source Files\WDL</Filter>
     </ClCompile>
@@ -108,6 +126,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\licecap_version.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\licecap_ui.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\resource.h">

@@ -16,7 +16,22 @@ _uicheck/
 # Debug log written by UIDbg() (contains temp paths with the user name)
 *uidbg*.txt
 
+# Scratch folders used by _uicheck5.ps1 (bookmark tests)
+_bmtest/
+
 # Test captures saved by the app default name (screen recordings: private)
 gifcam_*.gif
 LICEcap_*.gif
 *.lcf
+
+# Scratch folder used by _uicheck7.ps1 (unified settings tests)
+_settest/
+
+# Scratch folder used by _uicheck8.ps1 (timeline editor tests)
+_edittest/
+
+# Scratch folder used by _uicheck11.ps1 (bookmark drop-down tests)
+_dropchk/
+
+# Scratch folder used by _uicheck13.ps1 (open-a-GIF tests)
+_opentest/

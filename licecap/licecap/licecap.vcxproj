@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\licecap.rc" />
+    <Manifest Include="licecap.manifest" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\WDL\filebrowse.cpp" />
@@ -48,6 +49,12 @@
     <ClCompile Include="..\..\WDL\zlib\trees.c" />
     <ClCompile Include="..\..\WDL\zlib\zutil.c" />
     <ClCompile Include="..\licecap_ui.cpp" />
+    <ClCompile Include="..\ui_theme.cpp" />
+    <ClCompile Include="..\ui_draw.cpp" />
+    <ClCompile Include="..\ui_bookmarks.cpp" />
+    <ClCompile Include="..\ui_presets.cpp" />
+    <ClCompile Include="..\ui_gifedit.cpp" />
+    <ClCompile Include="..\ui_editor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\WDL\filebrowse.h" />
@@ -71,6 +78,7 @@
     <ClInclude Include="..\..\WDL\zlib\zlib.h" />
     <ClInclude Include="..\..\WDL\zlib\zutil.h" />
     <ClInclude Include="..\licecap_version.h" />
+    <ClInclude Include="..\licecap_ui.h" />
     <ClInclude Include="..\resource.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">

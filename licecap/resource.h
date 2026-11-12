@@ -1,4 +1,4 @@
-//{{NO_DEPENDENCIES}}
+﻿//{{NO_DEPENDENCIES}}
 // Microsoft Developer Studio generated include file.
 // Used by licecap.rc
 //
@@ -61,6 +61,15 @@
 #define IDC_WINSIZE_W                   1046
 #define IDC_WINSIZE_H                   1047
 #define IDC_DEFAULTS                    1048
+#define IDC_PRESETS                     1049
+#define IDC_CLOSEBTN                     1050
+// Unified settings dialog: appearance lives next to the rest of the options.
+#define IDC_SET_DARK                    1051
+#define IDC_SET_TOPMOST                 1052
+// Timeline editor: opens the trim strip over the last recording.
+#define IDC_EDITMODE                    1053
+// Drop-down row under Save: the bookmark folder recordings are saved into.
+#define IDC_BOOKMARKDROP                1054
 
 #define IDM_NEW                         40001
 #define IDM_FPS10                       40002
@@ -79,9 +88,25 @@
 #define IDM_SAVEAS                      40040
 #define IDM_SHOWINFOLDER                40041
 #define IDM_RECORD_TO_FILE              40042
+// Open a GIF from disk in the timeline editor (the file is edited through a copy)
+#define IDM_OPEN_GIF                    40043
 #define IDM_ALWAYS_ON_TOP               40050
 #define IDM_DEFAULT_SIZE                40051
 #define IDM_ABOUT                       40060
+#define IDM_DARK_THEME                  40061
+#define IDM_HALF_SIZE                   40062
+#define IDM_PRESET_FIRST                40100
+
+// Bookmarks: one id per slot, plus id ranges for the manage submenu.
+#define IDM_BOOKMARK_FIRST              40200
+#define IDM_BOOKMARK_REMOVE_FIRST       40240
+#define IDM_BOOKMARK_UP_FIRST           40280
+#define IDM_BOOKMARK_DOWN_FIRST         40320
+#define IDM_BOOKMARK_ADD                40360
+#define IDM_BOOKMARK_PICK               40361
+#define IDM_BOOKMARKS_PANEL             40362
+#define IDM_EDIT_TOGGLE                 40370
+#define LICECAP_MAX_BOOKMARKS           24
 
 // Next default values for new objects
 // 
@@ -89,7 +114,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        108
 #define _APS_NEXT_COMMAND_VALUE         40061
-#define _APS_NEXT_CONTROL_VALUE         1049
+#define _APS_NEXT_CONTROL_VALUE         1055
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
